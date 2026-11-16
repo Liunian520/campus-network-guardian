@@ -216,6 +216,8 @@ jobs:
           path: |
             dist/*-setup.exe
             dist/binary-versions.json
+            dist/installer-smoke-logs/*.log
+            dist/installer-smoke-logs/*.json
 
   publish:
     name: Publish tagged GitHub release

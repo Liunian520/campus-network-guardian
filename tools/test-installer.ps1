@@ -55,6 +55,7 @@ $shortcutDirectory = Join-Path ([Environment]::GetFolderPath('Programs')) '校�
 $shortcutPath = Join-Path $shortcutDirectory '校园网守护.lnk'
 $configurationCreated = $false
 $configurationHash = ''
+$diagnosticDirectory = Join-Path ([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))) 'dist\installer-smoke-logs'
 $testApplicationProcess = $null
 $smokeSucceeded = $false
 $cleanupFailures = [System.Collections.Generic.List[string]]::new()
@@ -97,18 +98,74 @@ function Assert-NoApplicationProcess {
     Assert-Condition -Condition ($processes.Count -eq 0) -Message 'The application is running; silent installation must not launch it.'
 }
 
+function Save-TestProcessDiagnostics {
+    param(
+        [string] $Stage, [string] $Executable, [string[]] $Arguments,
+        [string] $LogPath, [object] $ExitCode, [string] $Failure,
+        [DateTime] $StartedAt
+    )
+    Assert-Condition -Condition ($Stage -match '^[a-z0-9-]+$') -Message 'The diagnostic stage name is invalid.'
+    Assert-ChildPath -Path $LogPath -Parent $smokeDirectory
+    New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+    $logExists = Test-Path -LiteralPath $LogPath -PathType Leaf
+    $details = [ordered]@{
+        Stage = $Stage
+        Executable = $Executable
+        Arguments = $Arguments
+        ExitCode = $ExitCode
+        Failure = $Failure
+        StartedAtUtc = $StartedAt.ToUniversalTime().ToString('o')
+        FinishedAtUtc = [DateTime]::UtcNow.ToString('o')
+        WindowsVersion = [Environment]::OSVersion.VersionString
+        Is64BitOperatingSystem = [Environment]::Is64BitOperatingSystem
+        Is64BitProcess = [Environment]::Is64BitProcess
+        UICulture = [Globalization.CultureInfo]::CurrentUICulture.Name
+        Culture = [Globalization.CultureInfo]::CurrentCulture.Name
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        LogPath = $LogPath
+        LogExists = $logExists
+    }
+    $json = $details | ConvertTo-Json -Depth 4
+    Set-Content -LiteralPath (Join-Path $diagnosticDirectory "$Stage-process.json") -Value $json -Encoding utf8
+    if ($logExists) {
+        Copy-Item -LiteralPath $LogPath -Destination (Join-Path $diagnosticDirectory "$Stage.log") -Force
+    }
+    if ($null -eq $ExitCode -or $ExitCode -ne 0 -or -not [string]::IsNullOrEmpty($Failure)) {
+        Write-Host "Installer smoke process diagnostic for stage $Stage`:"
+        Write-Host $json
+        if ($logExists) {
+            Write-Host "Last 100 lines of the stage's Inno log (only test data and runner paths):"
+            Get-Content -LiteralPath $LogPath -Tail 100 | ForEach-Object { Write-Host ("  {0}" -f $_) }
+        } else {
+            Write-Host 'No requested Inno log was created. Failure may have occurred before logging initialized; the exact command and runner environment are recorded above.'
+        }
+    }
+}
+
 function Invoke-TestProcess {
-    param([string] $Executable, [string[]] $Arguments)
+    param([string] $Executable, [string[]] $Arguments, [string] $Stage, [string] $LogPath)
     # Inno's first phase can exit while a temporary second phase is still
     # uninstalling. -Wait tracks the process tree; the workflow step supplies
     # the overall five-minute timeout.
-    $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru -Wait
+    $process = $null
+    $failure = ''
+    $startedAt = [DateTime]::UtcNow
     try {
+        $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru -Wait
         if ($process.ExitCode -ne 0) {
-            throw "Installer or uninstaller returned exit code $($process.ExitCode)."
+            throw "Installer or uninstaller stage '$Stage' returned exit code $($process.ExitCode)."
         }
+    } catch {
+        $failure = $_.Exception.Message
+        throw
     } finally {
-        $process.Dispose()
+        $exitCode = if ($null -ne $process) { $process.ExitCode } else { $null }
+        try {
+            Save-TestProcessDiagnostics -Stage $Stage -Executable $Executable -Arguments $Arguments -LogPath $LogPath -ExitCode $exitCode -Failure $failure -StartedAt $startedAt
+        } catch {
+            Write-Warning ("Could not save installer diagnostics: {0}" -f $_.Exception.Message)
+        }
+        if ($null -ne $process) { $process.Dispose() }
     }
     Start-Sleep -Milliseconds 250
     Assert-NoApplicationProcess
@@ -270,7 +327,7 @@ function Invoke-TestInstall {
     param([string] $Stage)
     Write-Host "Installer smoke test: $Stage"
     $logPath = Join-Path $smokeDirectory "$Stage.log"
-    Invoke-TestProcess -Executable $setupExecutable -Arguments @(
+    Invoke-TestProcess -Executable $setupExecutable -Stage $Stage -LogPath $logPath -Arguments @(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
         "/DIR=`"$applicationDirectory`"", "/LOG=`"$logPath`""
     )
@@ -283,7 +340,7 @@ function Invoke-TestUninstall {
     Assert-Condition -Condition ($uninstallers.Count -eq 1) -Message 'Exactly one test uninstaller must be present.'
     Write-Host "Installer smoke test: $Stage"
     $logPath = Join-Path $smokeDirectory "$Stage.log"
-    Invoke-TestProcess -Executable $uninstallers[0].FullName -Arguments @(
+    Invoke-TestProcess -Executable $uninstallers[0].FullName -Stage $Stage -LogPath $logPath -Arguments @(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$logPath`""
     )
 }
