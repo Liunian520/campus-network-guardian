@@ -180,6 +180,50 @@ using Microsoft.Win32.SafeHandles;
 
 namespace CampusGuardianInstallerSmoke {
     public static class Native {
+        [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellLinkW {
+            // Preserve the native vtable order through GetArguments. The setter
+            // declarations are necessary slots, but this reader never calls them.
+            [PreserveSig] int GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int capacity, IntPtr findData, uint flags);
+            [PreserveSig] int GetIDList(out IntPtr itemList);
+            [PreserveSig] int SetIDList(IntPtr itemList);
+            [PreserveSig] int GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder description, int capacity);
+            [PreserveSig] int SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+            [PreserveSig] int GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int capacity);
+            [PreserveSig] int SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+            [PreserveSig] int GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int capacity);
+        }
+        [ComImport, Guid("0000010B-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IPersistFileReader {
+            [PreserveSig] int GetClassID(out Guid classId);
+            [PreserveSig] int IsDirty();
+            [PreserveSig] int Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+        }
+        private static void RequireSuccess(int result, string operation) {
+            if (result != 0) {
+                throw new COMException(operation + " returned HRESULT 0x" + result.ToString("X8") + ".", result);
+            }
+        }
+        public static string[] ReadShortcut(string path) {
+            object instance = Activator.CreateInstance(Type.GetTypeFromCLSID(
+                new Guid("00021401-0000-0000-C000-000000000046"), true));
+            try {
+                // STGM_READ. Loading initializes the object from the existing
+                // Unicode .lnk; do not Resolve, Save, or activate its target.
+                RequireSuccess(((IPersistFileReader)instance).Load(path, 0), "IPersistFile.Load");
+                var link = (IShellLinkW)instance;
+                var target = new StringBuilder(32768);
+                var arguments = new StringBuilder(32768);
+                var directory = new StringBuilder(32768);
+                RequireSuccess(link.GetPath(target, target.Capacity, IntPtr.Zero, 0), "IShellLinkW.GetPath");
+                RequireSuccess(link.GetArguments(arguments, arguments.Capacity), "IShellLinkW.GetArguments");
+                RequireSuccess(link.GetWorkingDirectory(directory, directory.Capacity), "IShellLinkW.GetWorkingDirectory");
+                return new string[] { target.ToString(), arguments.ToString(), directory.ToString() };
+            } finally {
+                if (instance != null) { Marshal.FinalReleaseComObject(instance); }
+            }
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct FileIdentity {
             public ulong VolumeSerialNumber;
@@ -425,50 +469,48 @@ function Assert-InstalledFiles {
         $key.Dispose()
     }
     Assert-Condition -Condition (Test-Path -LiteralPath $shortcutPath -PathType Leaf) -Message 'The Start menu shortcut is missing.'
-    $shell = New-Object -ComObject WScript.Shell
+    $shortcutBytes = [System.IO.File]::ReadAllBytes($shortcutPath)
+    $shortcutLinkFlags = if ($shortcutBytes.Length -ge 24) { '0x{0:X8}' -f [BitConverter]::ToUInt32($shortcutBytes, 0x14) } else { 'Header shorter than 24 bytes' }
+    $shortcutDiagnostic = [ordered]@{
+        ShortcutPath = $shortcutPath
+        Reader = 'IPersistFile.Load + IShellLinkW (Unicode, read only)'
+        ShortcutByteLength = $shortcutBytes.Length
+        ShellLinkFlags = $shortcutLinkFlags
+        ShortcutSHA256 = (Get-FileHash -LiteralPath $shortcutPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        RawShortcutBase64 = [Convert]::ToBase64String($shortcutBytes)
+        ExpectedTargetPath = $applicationExecutable
+        ExpectedArguments = '--show'
+        ExpectedWorkingDirectory = $applicationDirectory
+    }
     try {
-        $shortcut = $shell.CreateShortcut($shortcutPath)
-        try {
-            $shortcutDiagnostic = [ordered]@{
-                ShortcutPath = $shortcutPath
-                ActualTargetPath = [string] $shortcut.TargetPath
-                ExpectedTargetPath = $applicationExecutable
-                ActualArguments = [string] $shortcut.Arguments
-                ExpectedArguments = '--show'
-                ActualWorkingDirectory = [string] $shortcut.WorkingDirectory
-                ExpectedWorkingDirectory = $applicationDirectory
-            }
-            Write-Host ('Shortcut raw diagnostic: ' + ($shortcutDiagnostic | ConvertTo-Json -Compress))
-            try {
-                $actualIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut.TargetPath, $false)
-                $expectedIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationExecutable, $false)
-                $actualDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut.WorkingDirectory, $true)
-                $expectedDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationDirectory, $true)
-                $shortcutDiagnostic['ActualTargetIdentity'] = $actualIdentity[0]
-                $shortcutDiagnostic['ExpectedTargetIdentity'] = $expectedIdentity[0]
-                $shortcutDiagnostic['ActualTargetFinalPath'] = $actualIdentity[1]
-                $shortcutDiagnostic['ExpectedTargetFinalPath'] = $expectedIdentity[1]
-                $shortcutDiagnostic['ActualWorkingDirectoryIdentity'] = $actualDirectory[0]
-                $shortcutDiagnostic['ExpectedWorkingDirectoryIdentity'] = $expectedDirectory[0]
-                # Volume serial + 128-bit file ID proves the same file even if
-                # WScript reports an 8.3 or long spelling of the target path.
-                Assert-Condition -Condition ($actualIdentity[0] -ceq $expectedIdentity[0]) -Message 'The Start menu shortcut targets a different executable file identity.'
-                Assert-Condition -Condition ($actualDirectory[0] -ceq $expectedDirectory[0]) -Message 'The Start menu shortcut uses a different working directory identity.'
-            } catch {
-                $shortcutDiagnostic['IdentityFailure'] = $_.Exception.Message
-                throw
-            } finally {
-                New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
-                $shortcutJson = $shortcutDiagnostic | ConvertTo-Json -Depth 4
-                Set-Content -LiteralPath (Join-Path $diagnosticDirectory 'shortcut-diagnostic.json') -Value $shortcutJson -Encoding utf8
-                Write-Host $shortcutJson
-            }
-            Assert-Condition -Condition ($shortcut.Arguments -ceq '--show') -Message 'The Start menu shortcut must explicitly open the application window.'
-        } finally {
-            [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
-        }
+        $shortcut = [CampusGuardianInstallerSmoke.Native]::ReadShortcut($shortcutPath)
+        $shortcutDiagnostic['ActualTargetPath'] = $shortcut[0]
+        $shortcutDiagnostic['ActualArguments'] = $shortcut[1]
+        $shortcutDiagnostic['ActualWorkingDirectory'] = $shortcut[2]
+        $actualIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut[0], $false)
+        $expectedIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationExecutable, $false)
+        $actualDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut[2], $true)
+        $expectedDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationDirectory, $true)
+        $shortcutDiagnostic['ActualTargetIdentity'] = $actualIdentity[0]
+        $shortcutDiagnostic['ExpectedTargetIdentity'] = $expectedIdentity[0]
+        $shortcutDiagnostic['ActualTargetFinalPath'] = $actualIdentity[1]
+        $shortcutDiagnostic['ExpectedTargetFinalPath'] = $expectedIdentity[1]
+        $shortcutDiagnostic['ActualWorkingDirectoryIdentity'] = $actualDirectory[0]
+        $shortcutDiagnostic['ExpectedWorkingDirectoryIdentity'] = $expectedDirectory[0]
+        Assert-Condition -Condition ($actualIdentity[0] -ceq $expectedIdentity[0]) -Message 'The Start menu shortcut targets a different executable file identity.'
+        Assert-Condition -Condition ($actualDirectory[0] -ceq $expectedDirectory[0]) -Message 'The Start menu shortcut uses a different working directory identity.'
+        Assert-Condition -Condition ($shortcut[1] -ceq '--show') -Message 'The Start menu shortcut must explicitly open the application window.'
+    } catch {
+        $shortcutDiagnostic['ReadOrIdentityFailure'] = $_.Exception.Message
+        throw
     } finally {
-        [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $diagnosticDirectory 'shortcut-diagnostic.json') -Value ($shortcutDiagnostic | ConvertTo-Json -Depth 4) -Encoding utf8
+        $visibleDiagnostic = [ordered]@{}
+        foreach ($name in $shortcutDiagnostic.Keys) {
+            if ($name -ne 'RawShortcutBase64') { $visibleDiagnostic[$name] = $shortcutDiagnostic[$name] }
+        }
+        Write-Host ($visibleDiagnostic | ConvertTo-Json -Depth 4)
     }
 }
 
