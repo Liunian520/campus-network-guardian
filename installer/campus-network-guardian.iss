@@ -119,15 +119,19 @@ begin
   Result := ExpandFileName(Result);
 end;
 
-function MatchesInstalledRun(const Command: String): Boolean;
+function MatchesRunExecutable(const Command, Expected: String): Boolean;
 var
-  Expected, Value: String;
+  Value: String;
 begin
-  Expected := InstalledExecutable;
   Value := Trim(Command);
   { Accept only the exact executable command with no additional arguments. }
   Result := (CompareText(Value, '"' + Expected + '"') = 0) or
     (CompareText(Value, Expected) = 0);
+end;
+
+function MatchesInstalledRun(const Command: String): Boolean;
+begin
+  Result := MatchesRunExecutable(Command, InstalledExecutable);
 end;
 
 function TasksWereExplicitlySelected: Boolean;
@@ -149,13 +153,16 @@ end;
 
 procedure InitializeWizard;
 var
-  Command: String;
+  Command, Expected: String;
 begin
   { First install defaults to checked. On upgrades honor changes made in the
     application's settings since the last installation, unless /TASKS was set. }
-  if FileExists(InstalledExecutable) and not TasksWereExplicitlySelected then begin
+  { The app constant is not initialized yet. WizardDirValue already includes
+    the default, previous, or command-line directory selected by the wizard. }
+  Expected := ExpandFileName(AddBackslash(WizardDirValue) + '{#AppExeName}');
+  if FileExists(Expected) and not TasksWereExplicitlySelected then begin
     if RegQueryStringValue(HKCU, RunKey, RunValueName, Command) and
-      MatchesInstalledRun(Command) then
+      MatchesRunExecutable(Command, Expected) then
       WizardSelectTasks('autostart')
     else
       WizardSelectTasks('!autostart');
