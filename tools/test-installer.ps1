@@ -176,9 +176,53 @@ using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace CampusGuardianInstallerSmoke {
     public static class Native {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileIdentity {
+            public ulong VolumeSerialNumber;
+            public ulong FileIdLow;
+            public ulong FileIdHigh;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access,
+            uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(SafeFileHandle file,
+            int infoClass, out FileIdentity information, uint size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle file,
+            StringBuilder path, uint capacity, uint flags);
+
+        public static string[] IdentifyPath(string path, bool directory) {
+            if (String.IsNullOrWhiteSpace(path)) {
+                throw new ArgumentException("A shortcut path was empty.");
+            }
+            // Read attributes only; OPEN_EXISTING cannot create or modify files.
+            // FILE_FLAG_BACKUP_SEMANTICS permits opening a directory handle.
+            using (var file = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3,
+                directory ? 0x02000000u : 0x80u, IntPtr.Zero)) {
+                if (file.IsInvalid) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Opening a shortcut target for identity verification failed.");
+                }
+                FileIdentity identity;
+                if (!GetFileInformationByHandleEx(file, 18, out identity,
+                    (uint)Marshal.SizeOf(typeof(FileIdentity)))) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Reading a shortcut target's file identity failed.");
+                }
+                var finalPath = new StringBuilder(32768);
+                uint length = GetFinalPathNameByHandleW(file, finalPath, (uint)finalPath.Capacity, 0);
+                if (length == 0 || length >= finalPath.Capacity) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Resolving a shortcut target's final path failed.");
+                }
+                string id = identity.VolumeSerialNumber.ToString("X16") + ":" +
+                    identity.FileIdLow.ToString("X16") + identity.FileIdHigh.ToString("X16");
+                return new string[] { id, finalPath.ToString() };
+            }
+        }
+
         private delegate bool EnumWindowsCallback(IntPtr window, IntPtr state);
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr state);
@@ -229,6 +273,28 @@ namespace CampusGuardianInstallerSmoke {
     }
 }
 '@
+
+function Assert-FileIdentityVerification {
+    # Exercise only dummy data inside the guarded hosted-runner test directory.
+    # This must pass before using file identities to validate an installed .lnk.
+    $fixtureDirectory = Join-Path $smokeDirectory 'file-identity-regression'
+    Assert-ChildPath -Path $fixtureDirectory -Parent $smokeDirectory
+    New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
+    $first = Join-Path $fixtureDirectory 'first fake file.data'
+    $second = Join-Path $fixtureDirectory 'second fake file.data'
+    Set-Content -LiteralPath $first -Value 'Identical dummy content; never executable.' -Encoding ascii
+    Set-Content -LiteralPath $second -Value 'Identical dummy content; never executable.' -Encoding ascii
+    $original = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($first, $false)
+    $caseAlias = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($first.ToUpperInvariant(), $false)
+    $finalAlias = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($original[1], $false)
+    $different = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($second, $false)
+    $directory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($fixtureDirectory, $true)
+    $directoryAlias = [CampusGuardianInstallerSmoke.Native]::IdentifyPath((Join-Path $fixtureDirectory '.'), $true)
+    Assert-Condition -Condition ($original[0] -ceq $caseAlias[0] -and $original[0] -ceq $finalAlias[0]) -Message 'File identity failed to recognize equivalent dummy paths.'
+    Assert-Condition -Condition ($original[0] -cne $different[0]) -Message 'File identity incorrectly accepted different dummy files with identical contents.'
+    Assert-Condition -Condition ($directory[0] -ceq $directoryAlias[0]) -Message 'File identity failed to recognize equivalent dummy directory paths.'
+    Write-Host 'Hosted dummy-file identity checks passed: aliases match, same-content different files are rejected.'
+}
 
 function Wait-TestCondition {
     param([scriptblock] $Condition, [string] $Failure)
@@ -363,7 +429,40 @@ function Assert-InstalledFiles {
     try {
         $shortcut = $shell.CreateShortcut($shortcutPath)
         try {
-            Assert-Condition -Condition ($shortcut.TargetPath -ieq $applicationExecutable) -Message 'The Start menu shortcut targets a different executable.'
+            $shortcutDiagnostic = [ordered]@{
+                ShortcutPath = $shortcutPath
+                ActualTargetPath = [string] $shortcut.TargetPath
+                ExpectedTargetPath = $applicationExecutable
+                ActualArguments = [string] $shortcut.Arguments
+                ExpectedArguments = '--show'
+                ActualWorkingDirectory = [string] $shortcut.WorkingDirectory
+                ExpectedWorkingDirectory = $applicationDirectory
+            }
+            Write-Host ('Shortcut raw diagnostic: ' + ($shortcutDiagnostic | ConvertTo-Json -Compress))
+            try {
+                $actualIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut.TargetPath, $false)
+                $expectedIdentity = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationExecutable, $false)
+                $actualDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($shortcut.WorkingDirectory, $true)
+                $expectedDirectory = [CampusGuardianInstallerSmoke.Native]::IdentifyPath($applicationDirectory, $true)
+                $shortcutDiagnostic['ActualTargetIdentity'] = $actualIdentity[0]
+                $shortcutDiagnostic['ExpectedTargetIdentity'] = $expectedIdentity[0]
+                $shortcutDiagnostic['ActualTargetFinalPath'] = $actualIdentity[1]
+                $shortcutDiagnostic['ExpectedTargetFinalPath'] = $expectedIdentity[1]
+                $shortcutDiagnostic['ActualWorkingDirectoryIdentity'] = $actualDirectory[0]
+                $shortcutDiagnostic['ExpectedWorkingDirectoryIdentity'] = $expectedDirectory[0]
+                # Volume serial + 128-bit file ID proves the same file even if
+                # WScript reports an 8.3 or long spelling of the target path.
+                Assert-Condition -Condition ($actualIdentity[0] -ceq $expectedIdentity[0]) -Message 'The Start menu shortcut targets a different executable file identity.'
+                Assert-Condition -Condition ($actualDirectory[0] -ceq $expectedDirectory[0]) -Message 'The Start menu shortcut uses a different working directory identity.'
+            } catch {
+                $shortcutDiagnostic['IdentityFailure'] = $_.Exception.Message
+                throw
+            } finally {
+                New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+                $shortcutJson = $shortcutDiagnostic | ConvertTo-Json -Depth 4
+                Set-Content -LiteralPath (Join-Path $diagnosticDirectory 'shortcut-diagnostic.json') -Value $shortcutJson -Encoding utf8
+                Write-Host $shortcutJson
+            }
             Assert-Condition -Condition ($shortcut.Arguments -ceq '--show') -Message 'The Start menu shortcut must explicitly open the application window.'
         } finally {
             [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
@@ -411,6 +510,8 @@ try {
     Set-Content -LiteralPath $configurationPath -Value '{"smoke_test_only":true,"autostart":false}' -Encoding ascii
     $configurationCreated = $true
     $configurationHash = (Get-FileHash -LiteralPath $configurationPath -Algorithm SHA256).Hash
+
+    Assert-FileIdentityVerification
 
     Invoke-TestInstall -Stage 'fresh-install'
     Assert-InstalledFiles
