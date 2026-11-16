@@ -64,6 +64,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Test Inno compiler version parsing with output samples
+        run: ./tools/test-inno-compiler.ps1
+
       - name: Run simulated tests with locked dependencies
         run: cargo test --locked --all-targets
 
@@ -76,11 +79,19 @@ jobs:
       - name: Locate Inno Setup 6 or install verified compiler
         id: inno
         run: |
+          . ./tools/inno-compiler.ps1
           $isccPath = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           $compilerUsable = Test-Path -LiteralPath $isccPath -PathType Leaf
           if ($compilerUsable) {
-            $compilerVersion = (Get-Item -LiteralPath $isccPath).VersionInfo
-            $compilerUsable = $compilerVersion.FileMajorPart -eq 6 -and $compilerVersion.FileMinorPart -ge 5
+            try {
+              # Official ISCC builds can have PE FileVersion 0.0.0.0. Query
+              # the engine through the same output-disabled probe as the build.
+              $compilerVersion = Get-InnoCompilerVersion -CompilerPath $isccPath
+              $compilerUsable = Test-InnoCompilerVersion -Version $compilerVersion
+            } catch {
+              Write-Warning 'The existing Inno compiler could not be identified; using the verified compiler download.'
+              $compilerUsable = $false
+            }
           }
           if (-not $compilerUsable) {
             $compilerInstaller = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
@@ -98,6 +109,11 @@ jobs:
           if (-not (Test-Path -LiteralPath $isccPath -PathType Leaf)) {
             throw 'ISCC.exe was not found after compiler setup.'
           }
+          $compilerVersion = Get-InnoCompilerVersion -CompilerPath $isccPath
+          if (-not (Test-InnoCompilerVersion -Version $compilerVersion)) {
+            throw "Inno Setup 6.5 or newer in the 6.x series is required; found $compilerVersion."
+          }
+          Write-Host "Using Inno Setup engine $compilerVersion."
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$isccPath" -Encoding utf8
 
       - name: Build native executable and installer

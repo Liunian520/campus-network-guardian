@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'inno-compiler.ps1')
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $manifestPath = Join-Path $repositoryRoot 'Cargo.toml'
@@ -51,9 +52,9 @@ function Resolve-InnoCompiler {
 }
 
 $compilerPath = Resolve-InnoCompiler -RequestedPath $IsccPath
-$compilerVersion = (Get-Item -LiteralPath $compilerPath).VersionInfo
-if (($compilerVersion.FileMajorPart -ne 6) -or ($compilerVersion.FileMinorPart -lt 5)) {
-    throw "Inno Setup 6.5 or newer in the 6.x series is required; found $($compilerVersion.FileVersion)."
+$compilerVersion = Get-InnoCompilerVersion -CompilerPath $compilerPath
+if (-not (Test-InnoCompilerVersion -Version $compilerVersion)) {
+    throw "Inno Setup 6.5 or newer in the 6.x series is required; found compiler engine $compilerVersion."
 }
 $manifestText = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8
 $packageSection = [regex]::Match($manifestText, '(?ms)^\[package\]\s*(.*?)(?=^\[|\z)')
