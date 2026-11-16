@@ -17,6 +17,7 @@ if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_OS -cne 'Windows' -or $env:R
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or $ExpectedVersion -notmatch '^\d+\.\d+\.\d+$') {
     throw 'A runner temporary directory and a stable three-part version are required.'
 }
+. (Join-Path $PSScriptRoot 'windows-binary-version.ps1')
 
 function Assert-Condition {
     param([bool] $Condition, [string] $Message)
@@ -31,9 +32,13 @@ function Assert-ChildPath {
 }
 
 $setupExecutable = (Get-Item -LiteralPath $SetupPath).FullName
-$versionPattern = '^' + [regex]::Escape($ExpectedVersion) + '(?:\.0)?$'
 $setupVersion = (Get-Item -LiteralPath $setupExecutable).VersionInfo
-Assert-Condition -Condition ($setupVersion.ProductVersion -match $versionPattern -and $setupVersion.FileVersion -match $versionPattern) -Message 'The installer version does not match the requested version.'
+Write-Host ("Installer version diagnostic: expected={0}; ProductVersion=<{1}>; FileVersion=<{2}>; ProductParts={3}.{4}.{5}.{6}; FileParts={7}.{8}.{9}.{10}; ProductTextLength={11}; FileTextLength={12}" -f
+    $ExpectedVersion, $setupVersion.ProductVersion, $setupVersion.FileVersion,
+    $setupVersion.ProductMajorPart, $setupVersion.ProductMinorPart, $setupVersion.ProductBuildPart, $setupVersion.ProductPrivatePart,
+    $setupVersion.FileMajorPart, $setupVersion.FileMinorPart, $setupVersion.FileBuildPart, $setupVersion.FilePrivatePart,
+    ([string] $setupVersion.ProductVersion).Length, ([string] $setupVersion.FileVersion).Length)
+Assert-Condition -Condition (Test-WindowsBinaryVersion -VersionInfo $setupVersion -ExpectedVersion $ExpectedVersion) -Message 'The installer version does not match the requested version.'
 
 $runKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $runValueName = 'CampusNetworkGuardian'
@@ -286,7 +291,7 @@ function Invoke-TestUninstall {
 function Assert-InstalledFiles {
     Assert-Condition -Condition (Test-Path -LiteralPath $applicationExecutable -PathType Leaf) -Message 'The application was not installed in the current-user test location.'
     $version = (Get-Item -LiteralPath $applicationExecutable).VersionInfo
-    Assert-Condition -Condition ($version.ProductVersion -match $versionPattern -and $version.FileVersion -match $versionPattern) -Message 'The installed application version does not match the installer.'
+    Assert-Condition -Condition (Test-WindowsBinaryVersion -VersionInfo $version -ExpectedVersion $ExpectedVersion) -Message 'The installed application version does not match the installer.'
     Assert-Condition -Condition (Test-Path -LiteralPath (Join-Path $applicationDirectory 'LICENSE.txt') -PathType Leaf) -Message 'The installed license is missing.'
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($uninstallKeyPath, $false)
     Assert-Condition -Condition ($null -ne $key) -Message 'The installation was not registered under the current user.'

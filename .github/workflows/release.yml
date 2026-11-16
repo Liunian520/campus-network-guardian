@@ -67,6 +67,9 @@ jobs:
       - name: Test Inno compiler version parsing with output samples
         run: ./tools/test-inno-compiler.ps1
 
+      - name: Test Windows binary version validation with resource samples
+        run: ./tools/test-windows-binary-version.ps1
+
       - name: Run simulated tests with locked dependencies
         run: cargo test --locked --all-targets
 
@@ -121,6 +124,36 @@ jobs:
           ISCC_PATH: ${{ steps.inno.outputs.path }}
         run: ./tools/build-installer.ps1 -IsccPath $env:ISCC_PATH
 
+      - name: Record built binary version diagnostics
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $binaryPaths = @(
+            'target/installer-build/x86_64-pc-windows-msvc/release/campus-network-guardian.exe',
+            "dist/campus-network-guardian-${env:RELEASE_VERSION}-windows-x64-setup.exe"
+          )
+          $versionDiagnostics = foreach ($binaryPath in $binaryPaths) {
+            $binary = Get-Item -LiteralPath $binaryPath
+            $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary.FullName)
+            [ordered]@{
+              Name = $binary.Name
+              ExpectedVersion = $env:RELEASE_VERSION
+              Size = $binary.Length
+              SHA256 = (Get-FileHash -LiteralPath $binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              ProductVersion = $version.ProductVersion
+              FileVersion = $version.FileVersion
+              ProductTextLength = ([string] $version.ProductVersion).Length
+              FileTextLength = ([string] $version.FileVersion).Length
+              ProductParts = @($version.ProductMajorPart, $version.ProductMinorPart, $version.ProductBuildPart, $version.ProductPrivatePart)
+              FileParts = @($version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart)
+              GetItemProductVersion = $binary.VersionInfo.ProductVersion
+              GetItemFileVersion = $binary.VersionInfo.FileVersion
+            }
+          }
+          $versionJson = $versionDiagnostics | ConvertTo-Json -Depth 5
+          Set-Content -LiteralPath 'dist/binary-versions.json' -Value $versionJson -Encoding utf8
+          Write-Host $versionJson
+
       - name: Smoke-test installer on disposable hosted runner
         timeout-minutes: 5
         env:
@@ -132,13 +165,13 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
+          . ./tools/windows-binary-version.ps1
           $releaseVersion = $env:RELEASE_VERSION
           $assetPrefix = "campus-network-guardian-$releaseVersion-windows-x64"
           $nativeExe = Get-Item -LiteralPath 'target/installer-build/x86_64-pc-windows-msvc/release/campus-network-guardian.exe'
           $setupExe = Get-Item -LiteralPath "dist/$assetPrefix-setup.exe"
-          $versionPattern = '^' + [regex]::Escape($releaseVersion) + '(?:\.0)?$'
           foreach ($binary in @($nativeExe, $setupExe)) {
-            if ($binary.VersionInfo.ProductVersion -notmatch $versionPattern -or $binary.VersionInfo.FileVersion -notmatch $versionPattern) {
+            if (-not (Test-WindowsBinaryVersion -VersionInfo $binary.VersionInfo -ExpectedVersion $releaseVersion)) {
               throw "The embedded version in $($binary.Name) does not match Cargo $releaseVersion."
             }
           }
@@ -171,6 +204,18 @@ jobs:
             dist/campus-network-guardian-${{ steps.version.outputs.version }}-windows-x64-setup.exe
             dist/campus-network-guardian-${{ steps.version.outputs.version }}-windows-x64-portable.zip
             dist/SHA256SUMS.txt
+
+      - name: Upload failed-build installer and version diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          path: |
+            dist/*-setup.exe
+            dist/binary-versions.json
 
   publish:
     name: Publish tagged GitHub release
