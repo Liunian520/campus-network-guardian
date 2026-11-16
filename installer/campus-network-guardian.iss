@@ -90,6 +90,9 @@ const
   WaitObject0 = 0;
   WaitTimeout = 258;
 
+var
+  PendingAutostartSelection, DesiredAutostartSelection: Boolean;
+
 function FindGuardianWindow(Parent, After: HWND; ClassName: String;
   WindowName: Cardinal): HWND;
   external 'FindWindowExW@user32.dll stdcall';
@@ -160,12 +163,37 @@ begin
   { The app constant is not initialized yet. WizardDirValue already includes
     the default, previous, or command-line directory selected by the wizard. }
   Expected := ExpandFileName(AddBackslash(WizardDirValue) + '{#AppExeName}');
+  PendingAutostartSelection := False;
   if FileExists(Expected) and not TasksWereExplicitlySelected then begin
-    if RegQueryStringValue(HKCU, RunKey, RunValueName, Command) and
-      MatchesRunExecutable(Command, Expected) then
+    DesiredAutostartSelection :=
+      RegQueryStringValue(HKCU, RunKey, RunValueName, Command) and
+      MatchesRunExecutable(Command, Expected);
+    PendingAutostartSelection := True;
+    if DesiredAutostartSelection then
+      Log('Upgrade autostart preference: matching Run value exists; select autostart.')
+    else
+      Log('Upgrade autostart preference: no matching Run value; deselect autostart.');
+  end else if FileExists(Expected) then
+    Log('Upgrade autostart preference: honor explicit command-line task selection.')
+  else
+    Log('Fresh installation: keep the default or explicit command-line task selection.');
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  { Inno creates task items only when entering this page, after
+    InitializeWizard. Apply the saved preference once, after that creation;
+    revisiting the page must keep any subsequent choice made by the user. }
+  if (CurPageID = wpSelectTasks) and PendingAutostartSelection then begin
+    if DesiredAutostartSelection then
       WizardSelectTasks('autostart')
     else
       WizardSelectTasks('!autostart');
+    PendingAutostartSelection := False;
+    if WizardIsTaskSelected('autostart') then
+      Log('Applied upgrade autostart preference: task is selected.')
+    else
+      Log('Applied upgrade autostart preference: task is deselected.');
   end;
 end;
 
