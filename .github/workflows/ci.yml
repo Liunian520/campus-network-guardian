@@ -1,0 +1,59 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+
+jobs:
+  check:
+    name: Format, simulated tests, and UI contrast
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed.' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Selecting Rust failed.' }
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      # Default tests use fictitious credentials and loopback-only mock portals.
+      # Do not add --ignored or run the installed application in CI.
+      - name: Run simulated tests with locked dependencies
+        run: cargo test --locked --all-targets
+
+      - name: Check contrast audit implementation
+        run: python tools/check-ui-contrast.py --self-test
+
+      - name: Check UI contrast
+        run: python tools/check-ui-contrast.py

@@ -1,0 +1,22 @@
+[package]
+name = "campus-network-guardian"
+version = "0.4.0"
+edition = "2021"
+description = "Lightweight Windows campus-network guardian for WHUT dormitory networks"
+license = "MIT"
+repository = "https://github.com/Liunian520/campus-network-guardian"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.5", features = ["all"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WiFi", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Power", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_SystemServices"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
