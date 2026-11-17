@@ -419,6 +419,7 @@ mod win {
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     const APP_NAME: &str = "CampusNetworkGuardian";
     const PORTAL: &str = "http://172.30.21.100/";
+    const AUTHOR_URL: &str = "https://github.com/Liunian520";
     const TRAY: u32 = 0x8001;
     const WM_DESTROY: u32 = 2;
     const WM_CLOSE: u32 = 0x10;
@@ -469,10 +470,13 @@ mod win {
     const C_ADAPTER_DETAIL: usize = 134;
     const C_NAV_OVERVIEW: usize = 301;
     const C_NAV_SETTINGS: usize = 302;
+    const C_AUTHOR: usize = 303;
+    const C_ABOUT: usize = 304;
     const M_CHECK: usize = 201;
     const M_SETTINGS: usize = 202;
     const M_OPEN: usize = 203;
     const M_QUIT: usize = 204;
+    const M_ABOUT: usize = 205;
     const WS_CHILD: u32 = 0x40000000;
     const WS_VISIBLE: u32 = 0x10000000;
     const WS_TABSTOP: u32 = 0x10000;
@@ -670,6 +674,7 @@ mod win {
         fn EndPaint(h: Handle, paint: *const Paint) -> i32;
         fn SetProcessDPIAware() -> i32;
         fn GetDpiForSystem() -> u32;
+        fn GetSystemMetrics(index: i32) -> i32;
         fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void, flags: u32) -> i32;
         fn GetClientRect(h: Handle, rect: *mut Rect) -> i32;
         fn GetDC(h: Handle) -> Handle;
@@ -1166,6 +1171,22 @@ mod win {
     unsafe fn alert(h: Handle, msg: &str) {
         MessageBoxW(h, wide(msg).as_ptr(), wide("校园网守护").as_ptr(), 0x30);
     }
+    fn application_version() -> &'static str {
+        option_env!("CARGO_PKG_VERSION").unwrap_or("0.4.1")
+    }
+    unsafe fn show_about(h: Handle) {
+        let message = format!(
+            "校园网守护  v{}\r\n武汉理工大学校园网连接助手\r\n\r\n作者  Liunian520\r\n开源许可  MIT\r\n\r\n{}\r\n可点击侧栏作者署名，在浏览器中打开 GitHub 主页。",
+            application_version(),
+            AUTHOR_URL
+        );
+        MessageBoxW(
+            h,
+            wide(&message).as_ptr(),
+            wide("关于校园网守护").as_ptr(),
+            0x40,
+        );
+    }
     unsafe fn make_font(height: i32, weight: i32) -> Handle {
         CreateFontW(
             -scale_for_dpi(height, UI_DPI),
@@ -1242,6 +1263,7 @@ mod win {
                     | C_HTTP_HINT
                     | C_FORM_FEEDBACK
                     | C_ADAPTER_DETAIL
+                    | C_ABOUT
             ) {
                 SMALL_FONT
             } else {
@@ -1573,12 +1595,58 @@ mod win {
         }
     }
     unsafe fn layout_controls(h: Handle) {
+        let mut client: Rect = zeroed();
+        GetClientRect(h, &mut client);
+        let viewport_height = ((client.bottom as i64 * 96) / UI_DPI as i64) as i32;
+        let compact_sidebar = viewport_height < 328;
+        let footer_visible = viewport_height >= 208;
+        let footer_top = if compact_sidebar {
+            (viewport_height - 56).max(160)
+        } else {
+            viewport_height - 120
+        };
+        if !footer_visible && matches!(GetDlgCtrlID(GetFocus()) as usize, C_AUTHOR | C_ABOUT) {
+            SetFocus(GetDlgItem(
+                h,
+                if ACTIVE_PAGE == 2 {
+                    C_NAV_SETTINGS
+                } else {
+                    C_NAV_OVERVIEW
+                } as i32,
+            ));
+        }
         LAYOUT.with(|layout| {
             for item in layout.borrow().iter() {
-                let visible = item.page == 0 || item.page == ACTIVE_PAGE;
+                let id = GetDlgCtrlID(item.hwnd) as usize;
+                if id == C_AUTHOR {
+                    SetWindowTextW(
+                        item.hwnd,
+                        wide(if compact_sidebar {
+                            "Liunian520 · GitHub"
+                        } else {
+                            "Liunian520\r\n作者 · GitHub 主页"
+                        })
+                        .as_ptr(),
+                    );
+                }
+                let visible = (item.page == 0 || item.page == ACTIVE_PAGE)
+                    && (!matches!(id, C_AUTHOR | C_ABOUT) || footer_visible);
                 ShowWindow(item.hwnd, if visible { 5 } else { 0 });
                 let offset = if item.page == 0 { 0 } else { SCROLL_OFFSET };
-                let id = GetDlgCtrlID(item.hwnd) as usize;
+                let y = match id {
+                    C_NAV_OVERVIEW if compact_sidebar => 88,
+                    C_NAV_SETTINGS if compact_sidebar => 124,
+                    C_AUTHOR if compact_sidebar => footer_top,
+                    C_ABOUT if compact_sidebar => footer_top + 24,
+                    C_AUTHOR => footer_top + 8,
+                    C_ABOUT => footer_top + 64,
+                    _ => item.y,
+                };
+                let height = match id {
+                    C_NAV_OVERVIEW | C_NAV_SETTINGS if compact_sidebar => 32,
+                    C_AUTHOR | C_ABOUT if compact_sidebar => 24,
+                    _ => item.h,
+                };
                 let shift = if item.page == 2
                     && !matches!(id, C_SETTINGS_TITLE | C_FORM_SUBTITLE | C_FORM_FEEDBACK)
                 {
@@ -1589,9 +1657,9 @@ mod win {
                 MoveWindow(
                     item.hwnd,
                     scale_for_dpi(item.x, UI_DPI),
-                    scale_for_dpi(item.y + shift, UI_DPI) - offset,
+                    scale_for_dpi(y + shift, UI_DPI) - offset,
                     scale_for_dpi(item.w, UI_DPI),
-                    scale_for_dpi(item.h, UI_DPI),
+                    scale_for_dpi(height, UI_DPI),
                     1,
                 );
             }
@@ -1908,6 +1976,7 @@ mod win {
             AppendMenuW(m, 0, M_CHECK, wide("立即检查").as_ptr());
             AppendMenuW(m, 0, M_SETTINGS, wide("设置").as_ptr());
             AppendMenuW(m, 0, M_OPEN, wide("打开校园网认证页面").as_ptr());
+            AppendMenuW(m, 0, M_ABOUT, wide("关于校园网守护").as_ptr());
             AppendMenuW(m, 0, M_QUIT, wide("退出").as_ptr());
             let mut p = Point { x: 0, y: 0 };
             GetCursorPos(&mut p);
@@ -1993,7 +2062,7 @@ mod win {
         }
         if matches!(
             GetDlgCtrlID(focus) as usize,
-            C_NAV_OVERVIEW | C_NAV_SETTINGS
+            C_NAV_OVERVIEW | C_NAV_SETTINGS | C_AUTHOR | C_ABOUT
         ) {
             return;
         }
@@ -2111,23 +2180,12 @@ mod win {
         );
         paint_label(
             dc,
-            "网络连接助手",
+            "武汉理工大学",
             dip_rect(56, 52, 104, 20, false),
             SMALL_FONT,
             theme::TEXT_TERTIARY,
             0,
         );
-        let viewport_height = ((client.bottom as i64 * 96) / UI_DPI as i64) as i32;
-        if viewport_height >= 280 {
-            paint_label(
-                dc,
-                &format!("v{}", option_env!("CARGO_PKG_VERSION").unwrap_or("0.4.0")),
-                dip_rect(24, viewport_height - 40, 120, 20, false),
-                SMALL_FONT,
-                theme::TEXT_TERTIARY,
-                0,
-            );
-        }
         if ACTIVE_PAGE == 1 {
             rounded(
                 dc,
@@ -2188,6 +2246,7 @@ mod win {
     unsafe fn draw_button(item: &DrawItem) {
         let id = item.control_id as usize;
         let navigation = matches!(id, C_NAV_OVERVIEW | C_NAV_SETTINGS);
+        let footer = matches!(id, C_AUTHOR | C_ABOUT);
         let selected = (id == C_NAV_OVERVIEW && ACTIVE_PAGE == 1)
             || (id == C_NAV_SETTINGS && ACTIVE_PAGE == 2);
         let primary = matches!(id, C_SAVE | M_CHECK);
@@ -2198,7 +2257,7 @@ mod win {
         FillRect(
             item.dc,
             &item.rect,
-            if navigation {
+            if navigation || footer {
                 SIDEBAR_BRUSH
             } else {
                 BACKGROUND_BRUSH
@@ -2206,7 +2265,7 @@ mod win {
         );
         let fill = if disabled {
             theme::DISABLED_SURFACE
-        } else if navigation {
+        } else if navigation || footer {
             if pressed {
                 theme::NAV_PRESSED
             } else if selected {
@@ -2233,7 +2292,7 @@ mod win {
         } else {
             theme::SURFACE
         };
-        let border = if primary || navigation || tertiary {
+        let border = if primary || navigation || footer || tertiary {
             fill
         } else {
             theme::CONTROL_BORDER
@@ -2243,6 +2302,20 @@ mod win {
             theme::DISABLED_TEXT
         } else if primary {
             theme::TEXT_ON_PRIMARY
+        } else if id == C_AUTHOR {
+            if pressed {
+                theme::PRIMARY_PRESSED
+            } else if hover {
+                theme::PRIMARY_HOVER
+            } else {
+                theme::PRIMARY
+            }
+        } else if id == C_ABOUT {
+            if pressed {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_TERTIARY
+            }
         } else if id == C_DELETE {
             if hover {
                 theme::DANGER_TEXT
@@ -2276,7 +2349,12 @@ mod win {
         }
         if navigation {
             let icon_x = item.rect.left + scale_for_dpi(18, UI_DPI);
-            let icon_y = item.rect.top + scale_for_dpi(14, UI_DPI);
+            let icon_y = item.rect.top
+                + if item.rect.bottom - item.rect.top < scale_for_dpi(40, UI_DPI) {
+                    scale_for_dpi(8, UI_DPI)
+                } else {
+                    scale_for_dpi(14, UI_DPI)
+                };
             let pen = CreatePen(0, scale_for_dpi(2, UI_DPI), color);
             let old_pen = SelectObject(item.dc, pen);
             let old_brush = SelectObject(item.dc, GetStockObject(5));
@@ -2350,14 +2428,58 @@ mod win {
             C_NAV_SETTINGS => "认证设置",
             _ => &native_label,
         };
-        paint_label(
-            item.dc,
-            label,
-            bounds,
-            UI_FONT,
-            color,
-            0x4 | 0x20 | if navigation { 0 } else { 0x1 },
-        );
+        if id == C_AUTHOR {
+            let inset = scale_for_dpi(12, UI_DPI);
+            let compact = bounds.bottom - bounds.top < scale_for_dpi(40, UI_DPI);
+            paint_label(
+                item.dc,
+                "Liunian520",
+                Rect {
+                    left: bounds.left + inset,
+                    top: bounds.top + if compact { 0 } else { scale_for_dpi(5, UI_DPI) },
+                    right: bounds.right - inset,
+                    bottom: if compact {
+                        bounds.bottom
+                    } else {
+                        bounds.top + scale_for_dpi(25, UI_DPI)
+                    },
+                },
+                UI_FONT,
+                color,
+                0x4 | 0x20,
+            );
+            if !compact {
+                paint_label(
+                    item.dc,
+                    "作者 · GitHub 主页",
+                    Rect {
+                        left: bounds.left + inset,
+                        top: bounds.top + scale_for_dpi(27, UI_DPI),
+                        right: bounds.right - inset,
+                        bottom: bounds.bottom - scale_for_dpi(3, UI_DPI),
+                    },
+                    SMALL_FONT,
+                    if pressed {
+                        theme::TEXT_SECONDARY
+                    } else {
+                        theme::TEXT_TERTIARY
+                    },
+                    0x4 | 0x20,
+                );
+            }
+        } else {
+            if footer {
+                bounds.left += scale_for_dpi(12, UI_DPI);
+            }
+            paint_label(
+                item.dc,
+                label,
+                bounds,
+                if id == C_ABOUT { SMALL_FONT } else { UI_FONT },
+                color,
+                0x4 | 0x20 | if navigation || footer { 0 } else { 0x1 },
+            );
+        }
         if item.state & 0x10 != 0 && item.state & 0x200 == 0 {
             let inset = scale_for_dpi(3, UI_DPI);
             let focus = Rect {
@@ -2382,6 +2504,7 @@ mod win {
         match m {
             WM_SIZE => {
                 configure_scroll(h);
+                layout_controls(h);
                 0
             }
             WM_VSCROLL => {
@@ -2422,7 +2545,14 @@ mod win {
                 let item = &*(l as *const DrawItem);
                 if matches!(
                     item.control_id as usize,
-                    C_SAVE | C_DELETE | C_NAV_OVERVIEW | C_NAV_SETTINGS | M_CHECK | M_OPEN
+                    C_SAVE
+                        | C_DELETE
+                        | C_NAV_OVERVIEW
+                        | C_NAV_SETTINGS
+                        | C_AUTHOR
+                        | C_ABOUT
+                        | M_CHECK
+                        | M_OPEN
                 ) {
                     draw_button(item);
                     1
@@ -2556,6 +2686,20 @@ mod win {
                 match id {
                     C_NAV_OVERVIEW => show_page(h, 1),
                     C_NAV_SETTINGS => show_page(h, 2),
+                    C_AUTHOR => {
+                        if ShellExecuteW(
+                            h,
+                            wide("open").as_ptr(),
+                            wide(AUTHOR_URL).as_ptr(),
+                            null(),
+                            null(),
+                            1,
+                        ) <= 32
+                        {
+                            alert(h, "无法打开浏览器。作者主页：https://github.com/Liunian520");
+                        }
+                    }
+                    C_ABOUT | M_ABOUT => show_about(h),
                     C_SAVE => save_form(h),
                     C_DELETE => {
                         let Some(app) = app() else {
@@ -2678,6 +2822,8 @@ mod win {
                 bottom: scale_for_dpi(CONTENT_HEIGHT, UI_DPI),
             };
             AdjustWindowRectEx(&mut frame, window_style, 0, 0);
+            // AdjustWindowRectEx excludes the vertical scrollbar's width.
+            frame.right += GetSystemMetrics(2);
             let h = CreateWindowExW(
                 0,
                 class.as_ptr(),
@@ -2727,6 +2873,28 @@ mod win {
                 144,
                 40,
                 C_NAV_SETTINGS,
+            );
+            control(
+                h,
+                "BUTTON",
+                "Liunian520\r\n作者 · GitHub 主页",
+                WS_TABSTOP | 0x2000 | button_style,
+                12,
+                488,
+                144,
+                48,
+                C_AUTHOR,
+            );
+            control(
+                h,
+                "BUTTON",
+                &format!("关于 · v{} · MIT", application_version()),
+                WS_TABSTOP | button_style,
+                12,
+                544,
+                144,
+                32,
+                C_ABOUT,
             );
             BUILD_PAGE = 1;
             control(h, "STATIC", "连接概览", 0, 192, 24, 544, 32, C_TITLE);
@@ -2869,12 +3037,12 @@ mod win {
             control(
                 h,
                 "STATIC",
-                "仅在匹配的网络中自动认证",
+                "无线请先连接校园 Wi-Fi；\r\n列表缺失时检查 Windows 位置权限。",
                 0,
                 308,
-                108,
+                96,
                 408,
-                20,
+                40,
                 C_HINT_NETWORK,
             );
             control(

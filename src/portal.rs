@@ -1338,11 +1338,17 @@ pub(crate) mod test_support {
             }
         }
         pub fn client(&self) -> PortalClient {
+            self.client_with_guard(|| true)
+        }
+        pub fn client_with_guard(
+            &self,
+            guard: impl Fn() -> bool + Send + Sync + 'static,
+        ) -> PortalClient {
             PortalClient {
                 local: Ipv4Addr::LOCALHOST,
                 remote: self.address,
                 interface_index: None,
-                guard: Box::new(|| true),
+                guard: Box::new(guard),
                 gate: Arc::new(Mutex::new(())),
             }
         }

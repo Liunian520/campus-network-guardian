@@ -21,6 +21,7 @@ param(
     [switch]$ScrollBottom,
     [switch]$ClientOnly,
     [switch]$VerifyNavigation,
+    [switch]$VerifyAuthor,
     [switch]$VerifyTrayActivation,
     [switch]$VerifyValidation,
     [switch]$LongAdapter,
@@ -82,11 +83,11 @@ fn main() {
         Ok("very-long") => "门户提示账号异常，请打开认证页面检查；演示状态：这是一条较长的恢复提示，用于检查换行和内容布局。".repeat(12),
         _ => "校园网在线".into(),
     };
-    let adapter_name = if std::env::var_os("CAMPUS_PREVIEW_UNBROKEN_ADAPTER").is_some() {
+    let adapter_name = if std::env::var("CAMPUS_PREVIEW_UNBROKEN_ADAPTER").as_deref() == Ok("1") {
         // One ASCII run: DT_WORDBREAK can expand the measured width without
         // increasing height, so this cannot rely on ordinary word wrapping.
         format!("preview-adapter-{}-WHUT-ISP", "W".repeat(200))
-    } else if std::env::var_os("CAMPUS_PREVIEW_LONG_ADAPTER").is_some() {
+    } else if std::env::var("CAMPUS_PREVIEW_LONG_ADAPTER").as_deref() == Ok("1") {
         "预览网卡 · WHUT-ISP · USB 以太网适配器（用于验证较长中文与英文名称的动态换行、网关独立显示以及高 DPI 布局） / 网关 10.0.0.1".to_string()
     } else {
         "预览网卡 · WHUT-ISP / 网关 10.0.0.1".to_string()
@@ -115,8 +116,17 @@ fn main() {
 }
 '@
 [IO.File]::WriteAllText($previewSource, $previewText.Replace('__UI_SOURCE__', $uiSource), [Text.UTF8Encoding]::new($false))
-& rustc --edition 2021 --crate-name guardian_ui_preview $previewSource -C opt-level=1 -C debug-assertions=yes -C "link-arg=$ResourceLibrary" -o $previewExe
-if ($LASTEXITCODE -ne 0) { throw 'Preview compilation failed.' }
+$manifest = Get-Content -LiteralPath (Join-Path $workspace 'Cargo.toml') -Raw
+$versionMatch = [regex]::Match($manifest, '(?ms)^\[package\]\s*.*?^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
+if (-not $versionMatch.Success) { throw 'The package version is missing from Cargo.toml.' }
+$priorPackageVersion = [Environment]::GetEnvironmentVariable('CARGO_PKG_VERSION')
+try {
+    $env:CARGO_PKG_VERSION = $versionMatch.Groups[1].Value
+    & rustc --edition 2021 --crate-name guardian_ui_preview $previewSource -C opt-level=1 -C debug-assertions=yes -C "link-arg=$ResourceLibrary" -o $previewExe
+    if ($LASTEXITCODE -ne 0) { throw 'Preview compilation failed.' }
+} finally {
+    [Environment]::SetEnvironmentVariable('CARGO_PKG_VERSION', $priorPackageVersion)
+}
 
 Add-Type -AssemblyName System.Drawing
 if (-not ('GuardianPreviewNative' -as [type])) {
@@ -147,6 +157,7 @@ public static class GuardianPreviewNative {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr window, StringBuilder name, int count);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref Rect points, uint count);
     [DllImport("user32.dll")] public static extern bool GetScrollInfo(IntPtr window, int bar, ref ScrollInfo info);
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowStyle(IntPtr window, int index);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
@@ -210,7 +221,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         [GuardianPreviewNative]::PostMessage($Window, 0x28, $nav, [IntPtr]1) | Out-Null
         Start-Sleep -Milliseconds 100
         $ids = [Collections.Generic.List[int]]::new()
-        $allowed = if ($navigationPage -eq 'overview') { @(301,302,110,201,203) } else { @(301,302,101,102,103,104,105,106,107) }
+        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,110,201,203) } else { @(301,302,303,304,101,102,103,104,105,106,107) }
         for ($tab = 0; $tab -lt 20; $tab++) {
             $focus = [GuardianPreviewNative]::PreviewFocus($Window)
             if ($focus -eq [IntPtr]::Zero) { throw 'Preview does not expose background keyboard focus; no foreground activation was attempted.' }
@@ -295,6 +306,39 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         $report.Add('Short-screen manual scrolling remains at the requested position while the username field retains focus.')
     }
     return $report
+}
+
+function Test-PreviewAuthor([IntPtr]$Window) {
+    # Inspect native names, Tab style, and geometry only. Never activate the
+    # external link or show a modal dialog on the person's desktop.
+    $windowRect = [GuardianPreviewNative+Rect]::new()
+    $navigationRect = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetClientRect($Window, [ref]$windowRect) | Out-Null
+    [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$windowRect, 2) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($Window, 302), [ref]$navigationRect) | Out-Null
+    $priorBottom = $navigationRect.Bottom
+    foreach ($entry in @(
+        @{ Id=303; Label='Liunian520'; Role='GitHub' },
+        @{ Id=304; Label='关于'; Role='MIT' }
+    )) {
+        $control = [GuardianPreviewNative]::GetDlgItem($Window, $entry.Id)
+        if ($control -eq [IntPtr]::Zero) { throw "Author entry $($entry.Id) is missing." }
+        $label = [GuardianPreviewNative]::ReadControlText($control)
+        $style = [GuardianPreviewNative]::GetWindowStyle($control, -16).ToInt64()
+        if (-not [GuardianPreviewNative]::IsWindowVisible($control) -or ($style -band 0x10000) -eq 0 -or
+            -not $label.Contains($entry.Label) -or -not $label.Contains($entry.Role)) {
+            throw "Author entry $($entry.Id) is not a visible, keyboard-focusable, clearly named button: '$label'."
+        }
+        $rect = [GuardianPreviewNative+Rect]::new()
+        [GuardianPreviewNative]::GetWindowRect($control, [ref]$rect) | Out-Null
+        if ($rect.Top -lt $priorBottom -or $rect.Top -lt $windowRect.Top -or
+            $rect.Bottom -gt $windowRect.Bottom -or $rect.Left -lt $windowRect.Left -or
+            $rect.Right -gt $windowRect.Right -or $rect.Right -le $rect.Left) {
+            throw "Author entry $($entry.Id) overlaps navigation or leaves the available window."
+        }
+        $priorBottom = $rect.Bottom
+    }
+    'Author and About entries have clear native names, Tab support, and unobscured sidebar bounds; neither action was activated.'
 }
 
 function Test-PreviewTrayActivation([IntPtr]$Window) {
@@ -503,6 +547,9 @@ try {
         [IO.File]::WriteAllLines($reportPath, $report, [Text.UTF8Encoding]::new($false))
         Write-Output $reportPath
         $report | Write-Output
+    }
+    if ($VerifyAuthor) {
+        Test-PreviewAuthor $previewWindow | Write-Output
     }
     if ($UnbrokenAdapter) {
         Test-PreviewUnbrokenAdapter $previewWindow | Write-Output

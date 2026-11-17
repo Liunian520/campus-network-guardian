@@ -1,7 +1,7 @@
 ﻿; Build with tools/build-installer.ps1. This script never bundles user settings,
 ; credentials, logs, or the developer's running executable.
 #ifndef AppVersion
-  #define AppVersion "0.4.0"
+  #define AppVersion "0.4.1"
 #endif
 #ifndef RepoRoot
   #define RepoRoot ExtractFileDir(ExtractFileDir(__FILE__))
@@ -20,7 +20,10 @@ AppId=CampusNetworkGuardian.Windows
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=Campus Network Guardian contributors
+AppPublisher=Liunian520
+AppPublisherURL=https://github.com/Liunian520
+AppSupportURL=https://github.com/Liunian520/campus-network-guardian/issues
+AppUpdatesURL=https://github.com/Liunian520/campus-network-guardian/releases/latest
 VersionInfoVersion={#AppVersion}.0
 VersionInfoProductVersion={#AppVersion}.0
 VersionInfoProductName={#AppName}

@@ -422,4 +422,134 @@ mod tests {
             assert_eq!(match_adapter(&saved.identity, &[network]), None);
         }
     }
+
+    #[test]
+    fn wifi_reconnection_refreshes_ip_and_interface_index_without_reconfiguring() {
+        let saved = adapter("wifi", "10.0.0.1", Some(b"WHUT-ISP"), "10.0.0.5");
+        assert_eq!(match_adapter(&saved.identity, &[]), None);
+        let wired = adapter("ethernet", "10.0.0.1", None, "10.0.0.6");
+        let mut reconnected = saved.clone();
+        reconnected.ipv4 = "10.0.0.9".parse().unwrap();
+        reconnected.interface_index = 42;
+        assert_eq!(
+            match_adapter(&saved.identity, &[wired, reconnected]),
+            Some(NetworkConnection {
+                ipv4: "10.0.0.9".parse().unwrap(),
+                interface_index: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn wireless_identity_uses_raw_ssid_bytes_instead_of_lossy_display_names() {
+        let saved = adapter("wifi", "10.0.0.1", Some(b"WHUT-ISP\xff"), "10.0.0.5");
+        let other = adapter("wifi", "10.0.0.1", Some(b"WHUT-ISP\xfe"), "10.0.0.5");
+        assert_eq!(
+            String::from_utf8_lossy(saved.identity.ssid.as_ref().unwrap()),
+            String::from_utf8_lossy(other.identity.ssid.as_ref().unwrap())
+        );
+        assert_eq!(match_adapter(&saved.identity, &[other]), None);
+    }
+
+    #[test]
+    fn saved_wired_profile_does_not_silently_authorize_a_wireless_network() {
+        let wired = adapter("ethernet", "10.0.0.1", None, "10.0.0.5");
+        let wifi = adapter("wifi", "10.0.0.1", Some(b"WHUT-ISP"), "10.0.0.6");
+        assert_eq!(match_adapter(&wired.identity, &[wifi.clone()]), None);
+        assert!(match_adapter(&wifi.identity, &[wifi.clone()]).is_some());
+    }
+
+    #[test]
+    fn wireless_identity_guard_blocks_password_posts_and_recovers_on_return() {
+        use crate::controller::{Action, Controller};
+        use crate::portal::{
+            test_support::{LoginOutcome, MockPortal, RedialOutcome, TEST_PASSWORD, TEST_USERNAME},
+            DialState, PortalError, PortalStatus,
+        };
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        // The identity is synthetic. All HTTP traffic stays on loopback; no
+        // Windows WLAN API, routing state, saved config or credential is used.
+        let campus = adapter("test-wifi", "10.0.0.1", Some(b"WHUT-ISP"), "127.0.0.1");
+        let expected = campus.identity.clone();
+        let adapters = Arc::new(Mutex::new(vec![campus.clone()]));
+        let current = Arc::clone(&adapters);
+        let mock = MockPortal::new(
+            PortalStatus::Offline,
+            LoginOutcome::Success,
+            RedialOutcome::SuccessAfterPending(0),
+        );
+        let client = mock.client_with_guard(move || {
+            match_adapter(&expected, &current.lock().unwrap()).is_some()
+        });
+        let mut controller = Controller::new(Instant::now());
+
+        for replacement in [
+            None,
+            Some(adapter(
+                "test-wifi",
+                "10.0.0.1",
+                Some(b"OTHER"),
+                "127.0.0.1",
+            )),
+            Some(adapter("test-wifi", "10.0.0.1", None, "127.0.0.1")),
+            Some(adapter(
+                "test-wifi",
+                "10.1.0.1",
+                Some(b"WHUT-ISP"),
+                "127.0.0.1",
+            )),
+        ] {
+            *adapters.lock().unwrap() = replacement.into_iter().collect();
+            assert_eq!(
+                client.login(TEST_USERNAME, TEST_PASSWORD),
+                Err(PortalError::NetworkChanged)
+            );
+            assert_eq!(client.redial(), Err(PortalError::NetworkChanged));
+        }
+        assert!(mock
+            .requests()
+            .iter()
+            .all(|request| !request.starts_with("POST ")));
+
+        // Returning to the explicitly saved Wi-Fi uses the same login/redial
+        // controller as wired Ethernet, without needing to save again.
+        *adapters.lock().unwrap() = vec![campus];
+        controller.network_changed(Instant::now());
+        for _ in 0..4 {
+            let now = controller.next();
+            let action = controller.on_status(now, client.status());
+            match action {
+                Action::Login => controller.on_action_result(
+                    now,
+                    action,
+                    client.login(TEST_USERNAME, TEST_PASSWORD).map(Some),
+                ),
+                Action::Redial => {
+                    controller.on_action_result(now, action, client.redial().map(|()| None))
+                }
+                Action::None | Action::NetworkChanged => {}
+            }
+        }
+        assert_eq!(
+            client.status(),
+            Ok(PortalStatus::Online(DialState::Connected))
+        );
+        assert_eq!(controller.message(), "校园网在线");
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|r| r.as_str() == "POST /api/account/login")
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|r| r.as_str() == "POST /api/account/redial")
+                .count(),
+            1
+        );
+    }
 }
