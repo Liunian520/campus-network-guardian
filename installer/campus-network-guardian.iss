@@ -1,7 +1,7 @@
 ﻿; Build with tools/build-installer.ps1. This script never bundles user settings,
 ; credentials, logs, or the developer's running executable.
 #ifndef AppVersion
-  #define AppVersion "0.5.0"
+  #define AppVersion "0.5.1"
 #endif
 #ifndef RepoRoot
   #define RepoRoot ExtractFileDir(ExtractFileDir(__FILE__))

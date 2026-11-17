@@ -1172,7 +1172,7 @@ mod win {
         MessageBoxW(h, wide(msg).as_ptr(), wide("校园网守护").as_ptr(), 0x30);
     }
     fn application_version() -> &'static str {
-        option_env!("CARGO_PKG_VERSION").unwrap_or("0.5.0")
+        option_env!("CARGO_PKG_VERSION").unwrap_or("0.5.1")
     }
     unsafe fn show_about(h: Handle) {
         let message = format!(

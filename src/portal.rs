@@ -1,11 +1,15 @@
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PORTAL: Ipv4Addr = Ipv4Addr::new(172, 30, 21, 100);
+const PORTAL_HOST: &str = "172.30.21.100";
+const PROBE_HOST: &str = "www.msftconnecttest.com";
+const PROBE_PATH: &str = "/connecttest.txt";
 const MAX_RESPONSE: u64 = 256 * 1024;
 
 #[cfg(all(test, windows))]
@@ -39,30 +43,14 @@ mod live_read_only_test {
     }
 
     #[test]
-    #[ignore = "reads configured adapter and portal redirect, never logs in"]
-    fn configured_campus_nas_context_is_readable() {
-        let path = std::path::PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
-            .join("CampusNetworkGuardian")
-            .join("config.json");
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).expect("config")).expect("json");
-        let identity: crate::network::NetworkIdentity =
-            serde_json::from_value(config["identity"].clone()).expect("identity");
-        let connection = crate::network::matched_connection(&identity)
-            .expect("route")
-            .expect("selected campus adapter is not connected");
+    fn non_loopback_test_client_cannot_enable_public_discovery() {
         let client = PortalClient::new(
-            connection.ipv4,
-            connection.interface_index,
-            move || {
-                crate::network::matched_connection(&identity).ok().flatten() == Some(connection)
-            },
+            Ipv4Addr::new(10, 0, 0, 2),
+            12,
+            || false,
             Arc::new(Mutex::new(())),
         );
-        assert!(
-            client.discover_nas_id().is_ok(),
-            "portal context did not match selected adapter"
-        );
+        assert_eq!(client.probe_addresses(), Err(PortalError::ContextUnknown));
     }
 }
 
@@ -100,8 +88,10 @@ pub enum AuthFailure {
     Unknown,
 }
 
-/// HTTP transport deliberately connects only to the fixed campus address, binding
-/// the chosen local interface. It neither consults proxy settings nor redirects.
+/// Credential requests connect only to the fixed campus address. A separate,
+/// credential-free connectivity probe discovers the selected network's NAS.
+/// Every socket binds both the chosen interface and local address; redirects
+/// are returned for explicit validation, never followed by the transport.
 pub struct PortalClient {
     local: Ipv4Addr,
     remote: SocketAddrV4,
@@ -141,6 +131,40 @@ impl PortalClient {
         body: &[u8],
         allow_redirect: bool,
     ) -> Result<Response, PortalError> {
+        self.request_to(
+            self.remote,
+            PORTAL_HOST,
+            method,
+            path,
+            headers,
+            body,
+            allow_redirect,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn request_to(
+        &self,
+        remote: SocketAddrV4,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &str,
+        body: &[u8],
+        allow_redirect: bool,
+    ) -> Result<Response, PortalError> {
+        let portal_request = remote == self.remote && host == PORTAL_HOST;
+        if !portal_request && (method != "GET" || !headers.is_empty() || !body.is_empty()) {
+            return Err(PortalError::ContextUnknown);
+        }
+        if !matches!(method, "GET" | "POST")
+            || !path.starts_with('/')
+            || !path.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        {
+            return Err(PortalError::ContextUnknown);
+        }
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|_| PortalError::Network)?;
         if let Some(index) = self.interface_index {
@@ -154,7 +178,7 @@ impl PortalClient {
             .bind(&SocketAddr::V4(SocketAddrV4::new(self.local, 0)).into())
             .map_err(|_| PortalError::Network)?;
         socket
-            .connect_timeout(&SocketAddr::V4(self.remote).into(), Duration::from_secs(5))
+            .connect_timeout(&SocketAddr::V4(remote).into(), Duration::from_secs(5))
             .map_err(|_| PortalError::Network)?;
         let mut stream: TcpStream = socket.into();
         stream
@@ -166,7 +190,7 @@ impl PortalClient {
         let mut request = SecretBytes(Vec::with_capacity(
             method.len() + path.len() + headers.len() + body.len() + 256,
         ));
-        write!(request.0, "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json, text/html\r\n{headers}Content-Length: {}\r\n\r\n", self.remote.ip(), body.len()).map_err(|_| PortalError::Network)?;
+        write!(request.0, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json, text/html\r\n{headers}Content-Length: {}\r\n\r\n", body.len()).map_err(|_| PortalError::Network)?;
         request.0.extend_from_slice(body);
         // Serialize final validation and the complete write with settings and
         // credential changes. Never hold the lock while awaiting a response.
@@ -201,43 +225,56 @@ impl PortalClient {
         }
         parse_http_inner(&bytes, allow_redirect)
     }
-    /// Read the portal's route context without following arbitrary redirects.
+    /// Discover context from an intercepted connectivity probe. The portal's
+    /// default route can identify an unrelated campus NAS and is never used.
     fn discover_nas_id(&self) -> Result<String, PortalError> {
-        let first = self.request_inner("GET", "/api/r/default", "", b"", true)?;
-        let path = first.location.as_deref().ok_or(PortalError::Unexpected)?;
-        let path = path.strip_prefix("http://172.30.21.100").unwrap_or(path);
-        let id = path
-            .strip_prefix("/api/r/")
-            .ok_or(PortalError::Unexpected)?;
-        if id.is_empty() || id.len() > 20 || !id.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(PortalError::Unexpected);
-        }
-        let second = self.request_inner("GET", path, "", b"", true)?;
-        let final_location = second.location.as_deref().ok_or(PortalError::Unexpected)?;
-        let final_location = final_location
-            .strip_prefix("http://172.30.21.100")
-            .unwrap_or(final_location);
-        let query = final_location
-            .strip_prefix("/tpl/whut/login.html?")
-            .ok_or(PortalError::Unexpected)?;
-        if query.contains('#') || query.len() > 2048 {
-            return Err(PortalError::Unexpected);
-        }
-        let mut ip = None;
-        let mut nas = None;
-        for item in query.split('&') {
-            let (key, value) = item.split_once('=').ok_or(PortalError::Unexpected)?;
-            match key {
-                "ip" if ip.is_none() => ip = Some(value),
-                "nasId" if nas.is_none() => nas = Some(value),
-                "ip" | "nasId" => return Err(PortalError::Unexpected),
-                _ => {}
+        let discover = || {
+            let mut first = None;
+            for remote in self.probe_addresses()? {
+                match self.request_to(remote, PROBE_HOST, "GET", PROBE_PATH, "", b"", true) {
+                    Ok(response) => {
+                        first = Some(response);
+                        break;
+                    }
+                    Err(PortalError::Network) => continue,
+                    Err(error) => return Err(error),
+                }
             }
-        }
-        if ip.and_then(|s| s.parse::<Ipv4Addr>().ok()) != Some(self.local) || nas != Some(id) {
-            return Err(PortalError::Unexpected);
-        }
-        Ok(id.to_owned())
+            let first = first.ok_or(PortalError::ContextUnknown)?;
+            let location = first
+                .location
+                .as_deref()
+                .ok_or(PortalError::ContextUnknown)?;
+            let (path, id) = captive_route(location, self.local)?;
+            let second = self.request_inner("GET", path, "", b"", true)?;
+            verify_login_location(
+                second
+                    .location
+                    .as_deref()
+                    .ok_or(PortalError::ContextUnknown)?,
+                self.local,
+                id,
+            )?;
+            Ok(id.to_owned())
+        };
+        discover().map_err(|error| match error {
+            PortalError::NetworkChanged => error,
+            _ => PortalError::ContextUnknown,
+        })
+    }
+    #[cfg(test)]
+    fn probe_addresses(&self) -> Result<Vec<SocketAddrV4>, PortalError> {
+        // Test clients explicitly inject a loopback HTTP server as `remote`.
+        // Even ignored tests cannot accidentally resolve or contact the public probe.
+        self.remote
+            .ip()
+            .is_loopback()
+            .then(|| vec![self.remote])
+            .ok_or(PortalError::ContextUnknown)
+    }
+    #[cfg(not(test))]
+    fn probe_addresses(&self) -> Result<Vec<SocketAddrV4>, PortalError> {
+        resolve_probe_addresses()
     }
     /// Verify expected page before any credential-bearing request. HTTP does not
     /// authenticate its peer; the user must explicitly accept that risk.
@@ -327,6 +364,161 @@ impl PortalClient {
             Err(PortalError::Unexpected)
         }
     }
+}
+
+#[cfg(not(test))]
+fn resolve_probe_addresses() -> Result<Vec<SocketAddrV4>, PortalError> {
+    use std::{net::ToSocketAddrs, sync::mpsc, thread};
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("campus-probe-dns".into())
+        .spawn(move || {
+            let addresses = (PROBE_HOST, 80).to_socket_addrs().map(|addresses| {
+                let mut selected = Vec::new();
+                for address in addresses {
+                    if let SocketAddr::V4(address) = address {
+                        let ip = address.ip();
+                        if !ip.is_unspecified()
+                            && !ip.is_loopback()
+                            && !ip.is_multicast()
+                            && !ip.is_broadcast()
+                            && !selected.contains(&address)
+                        {
+                            selected.push(address);
+                            if selected.len() == 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                selected
+            });
+            let _ = sender.send(addresses);
+        })
+        .map_err(|_| PortalError::ContextUnknown)?;
+    let addresses = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| PortalError::ContextUnknown)?
+        .map_err(|_| PortalError::ContextUnknown)?;
+    if addresses.is_empty() {
+        Err(PortalError::ContextUnknown)
+    } else {
+        Ok(addresses)
+    }
+}
+
+fn fixed_portal_path(location: &str, require_absolute: bool) -> Result<&str, PortalError> {
+    if let Some(path) = location.strip_prefix("http://172.30.21.100/") {
+        return Ok(&location[location.len() - path.len() - 1..]);
+    }
+    if !require_absolute && location.starts_with('/') && !location.starts_with("//") {
+        return Ok(location);
+    }
+    Err(PortalError::ContextUnknown)
+}
+
+fn query_component(raw: &str) -> Result<String, PortalError> {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut bytes = raw.bytes();
+    while let Some(byte) = bytes.next() {
+        let byte = match byte {
+            b'%' => {
+                let digit = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
+                let high = digit(bytes.next().ok_or(PortalError::ContextUnknown)?)
+                    .ok_or(PortalError::ContextUnknown)?;
+                let low = digit(bytes.next().ok_or(PortalError::ContextUnknown)?)
+                    .ok_or(PortalError::ContextUnknown)?;
+                high * 16 + low
+            }
+            b'+' => b' ',
+            other => other,
+        };
+        if byte < 0x20 || byte == 0x7f || matches!(byte, b'\\' | b'#') {
+            return Err(PortalError::ContextUnknown);
+        }
+        decoded.push(byte);
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| PortalError::ContextUnknown)?;
+    if decoded.trim().is_empty() {
+        return Err(PortalError::ContextUnknown);
+    }
+    Ok(decoded)
+}
+
+fn context_query(query: &str) -> Result<HashMap<String, String>, PortalError> {
+    if query.is_empty()
+        || query.len() > 2048
+        || !query.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        || query.contains(['#', '\\', '?'])
+    {
+        return Err(PortalError::ContextUnknown);
+    }
+    let mut parameters = HashMap::new();
+    let mut unique = std::collections::HashSet::new();
+    for pair in query.split('&') {
+        if parameters.len() >= 32 {
+            return Err(PortalError::ContextUnknown);
+        }
+        let (key, value) = pair.split_once('=').ok_or(PortalError::ContextUnknown)?;
+        let key = query_component(key)?;
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || !unique.insert(key.to_ascii_lowercase())
+        {
+            return Err(PortalError::ContextUnknown);
+        }
+        // The real campus gateway can include an empty optional WLAN AC name.
+        // Required source IP/NAS fields still have to parse and match below.
+        let value = if key == "wlanacname" && value.is_empty() {
+            String::new()
+        } else {
+            query_component(value)?
+        };
+        parameters.insert(key, value);
+    }
+    Ok(parameters)
+}
+
+fn captive_route(location: &str, local: Ipv4Addr) -> Result<(&str, &str), PortalError> {
+    let path = fixed_portal_path(location, true)?;
+    let (route, query) = path.split_once('?').ok_or(PortalError::ContextUnknown)?;
+    let id = route
+        .strip_prefix("/api/r/")
+        .ok_or(PortalError::ContextUnknown)?;
+    if id.is_empty() || id.len() > 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PortalError::ContextUnknown);
+    }
+    let parameters = context_query(query)?;
+    if parameters
+        .get("userip")
+        .and_then(|value| value.parse::<Ipv4Addr>().ok())
+        != Some(local)
+    {
+        return Err(PortalError::ContextUnknown);
+    }
+    Ok((path, id))
+}
+
+fn verify_login_location(location: &str, local: Ipv4Addr, id: &str) -> Result<(), PortalError> {
+    let path = fixed_portal_path(location, false)?;
+    let (template, query) = path.split_once('?').ok_or(PortalError::ContextUnknown)?;
+    if !matches!(template, "/tpl/isp/login.html" | "/tpl/whut/login.html") {
+        return Err(PortalError::ContextUnknown);
+    }
+    let parameters = context_query(query)?;
+    if parameters
+        .get("ip")
+        .and_then(|value| value.parse::<Ipv4Addr>().ok())
+        != Some(local)
+        || parameters.get("nasId").map(String::as_str) != Some(id)
+        || parameters
+            .get("userip")
+            .is_some_and(|value| value.parse::<Ipv4Addr>().ok() != Some(local))
+    {
+        return Err(PortalError::ContextUnknown);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -839,6 +1031,50 @@ mod transport_tests {
         )
     }
     #[test]
+    fn non_portal_sensitive_requests_are_rejected_before_connecting() {
+        let portal = TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        portal.set_nonblocking(true).unwrap();
+        probe.set_nonblocking(true).unwrap();
+        let portal_remote =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, portal.local_addr().unwrap().port());
+        let probe_remote =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, probe.local_addr().unwrap().port());
+        assert_ne!(portal_remote, probe_remote);
+        let client = PortalClient {
+            local: Ipv4Addr::LOCALHOST,
+            remote: portal_remote,
+            interface_index: None,
+            guard: Box::new(|| true),
+            gate: Arc::new(Mutex::new(())),
+        };
+        for (remote, host, method, headers, body) in [
+            (probe_remote, PORTAL_HOST, "POST", "", &b""[..]),
+            (
+                probe_remote,
+                PROBE_HOST,
+                "GET",
+                "Cookie: yudear=fake-cookie\r\n",
+                &b""[..],
+            ),
+            (probe_remote, PROBE_HOST, "GET", "", &b"fake-password"[..]),
+            (portal_remote, PROBE_HOST, "POST", "", &b""[..]),
+        ] {
+            assert_eq!(
+                client
+                    .request_to(remote, host, method, PROBE_PATH, headers, body, true)
+                    .err(),
+                Some(PortalError::ContextUnknown)
+            );
+        }
+        for listener in [&portal, &probe] {
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    #[test]
     fn rejects_redirect_without_following_it() {
         assert!(parse_http(
             b"HTTP/1.1 302 Found\r\nLocation: http://elsewhere/\r\nContent-Length: 0\r\n\r\n"
@@ -881,10 +1117,10 @@ mod transport_tests {
     }
 
     #[test]
-    fn login_discovers_numeric_nas_and_sends_it_with_credentials() {
+    fn login_uses_captive_wireless_nas_instead_of_the_unrelated_default_route() {
         let page = Box::leak(ok("/account/status /account/redial /account/check").into_boxed_str());
-        let first = "HTTP/1.1 302 Found\r\nLocation: /api/r/14\r\nContent-Length: 0\r\n\r\n";
-        let second = "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/tpl/whut/login.html?ip=127.0.0.1&nasId=14\r\nContent-Length: 0\r\n\r\n";
+        let first = "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/52?acip=172.30.1.223&acname=WHUT-Bras-ME60-A&userip=127.0.0.1&wlanacname=\r\nContent-Length: 0\r\n\r\n";
+        let second = "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/tpl/isp/login.html?ip=127.0.0.1&nasId=52&acip=172.30.1.223&wlanacname=\r\nContent-Length: 0\r\n\r\n";
         let session = "HTTP/1.1 200 OK\r\nSet-Cookie: yudear=abc; Path=/\r\nContent-Length: 22\r\n\r\n{\"csrf_token\":\"12345\"}";
         let check = Box::leak(ok(r#"{"code":0,"isChangePwd":0}"#).into_boxed_str());
         let login = Box::leak(ok(r#"{"code":0}"#).into_boxed_str());
@@ -897,27 +1133,62 @@ mod transport_tests {
             Ok(PortalStatus::Online(DialState::Disabled))
         );
         let requests = task.join().unwrap();
-        assert!(requests[1].starts_with("GET /api/r/default "));
-        assert!(requests[2].starts_with("GET /api/r/14 "));
+        assert!(requests[1].starts_with("GET /connecttest.txt "));
+        assert!(requests[1].contains("Host: www.msftconnecttest.com\r\n"));
+        assert!(!requests[1].contains("Cookie:"));
+        assert!(!requests[1].contains("fake-user"));
+        assert!(requests[2].starts_with(
+            "GET /api/r/52?acip=172.30.1.223&acname=WHUT-Bras-ME60-A&userip=127.0.0.1&wlanacname= "
+        ));
+        assert!(!requests
+            .iter()
+            .any(|request| request.contains("/api/r/default")));
         for req in [&requests[4], &requests[5]] {
             assert!(req
-                .contains("username=fake-user&password=fake-password&userIpv4=127.0.0.1&nasId=14"));
+                .contains("username=fake-user&password=fake-password&userIpv4=127.0.0.1&nasId=52"));
         }
+    }
+
+    #[test]
+    fn a_successful_connectivity_probe_does_not_authorize_login() {
+        let page = Box::leak(ok("/account/status /account/redial /account/check").into_boxed_str());
+        let probe = Box::leak(ok("Microsoft Connect Test").into_boxed_str());
+        let (client, task) = serve(vec![page, probe]);
+        assert_eq!(
+            client.login("fake-user", "fake-password"),
+            Err(PortalError::ContextUnknown)
+        );
+        assert!(task
+            .join()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
     }
 
     #[test]
     fn unsafe_authentication_context_never_sends_credentials() {
         let page: &'static str =
             Box::leak(ok("/account/status /account/redial /account/check").into_boxed_str());
-        let first = "HTTP/1.1 302 Found\r\nLocation: /api/r/14\r\nContent-Length: 0\r\n\r\n";
+        let first = "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/14?userip=127.0.0.1\r\nContent-Length: 0\r\n\r\n";
         for location in [
-            "http://evil.example/api/r/14",
-            "http://172.30.21.100.evil.example/api/r/14",
-            "//evil.example/api/r/14",
+            "http://evil.example/api/r/14?userip=127.0.0.1",
+            "http://172.30.21.100.evil.example/api/r/14?userip=127.0.0.1",
+            "http://172.30.21.100@evil.example/api/r/14?userip=127.0.0.1",
+            "http://172.30.21.100:81/api/r/14?userip=127.0.0.1",
+            "https://172.30.21.100/api/r/14?userip=127.0.0.1",
+            "//evil.example/api/r/14?userip=127.0.0.1",
             "/api/r/../14",
             "/api/r/isp",
             "/api/r/14?extra=1",
             "/api/r/123456789012345678901",
+            "http://172.30.21.100/api/r/default?userip=127.0.0.1",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.2",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.1&userip=127.0.0.1",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.1&%75serip=127.0.0.1",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.1&acname=",
+            "http://172.30.21.100/api/r/14?userip=&acname=WHUT",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.1&acname=%0d%0aCookie%3Abad",
+            "http://172.30.21.100/api/r/14?userip=127.0.0.1#fragment",
         ] {
             let redirect: &'static str = Box::leak(
                 format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
@@ -939,6 +1210,9 @@ mod transport_tests {
             "http://evil.example/tpl/whut/login.html?ip=127.0.0.1&nasId=14",
             "http://172.30.21.100.evil.example/tpl/whut/login.html?ip=127.0.0.1&nasId=14",
             "/tpl/whut/login.html?ip=127.0.0.1&nasId=14#fragment",
+            "/tpl/isp/login.html?ip=127.0.0.1&nasId=14&acname=",
+            "/tpl/isp/login.html?ip=127.0.0.1&nasId=14&%6easId=14",
+            "/tpl/other/login.html?ip=127.0.0.1&nasId=14",
         ] {
             let redirect: &'static str = Box::leak(
                 format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
@@ -972,7 +1246,7 @@ mod login_flow_tests {
         let worker = thread::spawn(move || {
             let bodies = [
                 "/account/status /account/redial /account/check",
-                "REDIRECT_DEFAULT",
+                "REDIRECT_PROBE",
                 "REDIRECT_NAS",
                 "{\"csrf_token\":\"test\"}",
                 "{\"code\":0,\"isChangePwd\":0}",
@@ -1008,7 +1282,7 @@ mod login_flow_tests {
                 }
                 requests.push(String::from_utf8(buf).unwrap());
                 let response = match body {
-                    "REDIRECT_DEFAULT" => "HTTP/1.1 302 Found\r\nLocation: /api/r/14\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                    "REDIRECT_PROBE" => "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/14?userip=127.0.0.1\r\nContent-Length: 0\r\n\r\n".to_owned(),
                     "REDIRECT_NAS" => "HTTP/1.1 302 Found\r\nLocation: /tpl/whut/login.html?ip=127.0.0.1&nasId=14\r\nContent-Length: 0\r\n\r\n".to_owned(),
                     _ => format!("HTTP/1.1 200 OK\r\nSet-Cookie: yudear=test; Path=/\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
                 };
@@ -1416,6 +1690,8 @@ pub(crate) mod test_support {
         let redirect = match (method, path) {
             ("GET", "/api/r/default") => Some("/api/r/14"),
             ("GET", "/api/r/14") => Some("/tpl/whut/login.html?ip=127.0.0.1&nasId=14"),
+            ("GET", "/connecttest.txt") => Some("http://172.30.21.100/api/r/52?acip=172.30.1.223&acname=WHUT-Bras-ME60-A&userip=127.0.0.1"),
+            ("GET", "/api/r/52?acip=172.30.1.223&acname=WHUT-Bras-ME60-A&userip=127.0.0.1") => Some("/tpl/isp/login.html?ip=127.0.0.1&nasId=52"),
             _ => None,
         };
         if let Some(location) = redirect {
@@ -1429,7 +1705,7 @@ pub(crate) mod test_support {
         let authorized = head.contains("X-CSRF-Token: mock-token\r\n")
             && head.contains("Cookie: yudear=mock-cookie\r\n");
         let valid_credentials = &bytes[body_start..]
-            == b"username=example-user&password=example-password&userIpv4=127.0.0.1&nasId=14";
+            == b"username=example-user&password=example-password&userIpv4=127.0.0.1&nasId=52";
         let mut timeout = false;
         let mut drop_response = false;
         let mut reset_response = false;
