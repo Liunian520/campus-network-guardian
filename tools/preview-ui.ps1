@@ -14,7 +14,7 @@ param(
     [string]$Page = 'all',
     [ValidateSet(96, 120, 144, 192)]
     [int]$Dpi = 96,
-    [ValidateSet('online', 'waiting', 'long-error', 'very-long')]
+    [ValidateSet('online', 'waiting', 'wifi-mac', 'long-error', 'very-long')]
     [string]$Status = 'online',
     [string]$ResourceLibrary,
     [int]$WindowHeight = 0,
@@ -77,6 +77,7 @@ fn main() {
     let (tx, _rx) = mpsc::channel();
     let status: String = match std::env::var("CAMPUS_PREVIEW_STATUS").as_deref() {
         Ok("waiting") => "网络已变化，正在等待网络稳定".into(),
+        Ok("wifi-mac") => "校园 Wi-Fi 随机 MAC 已关闭；等待下次连接后确认固定地址。自动认证暂缓，不主动断开当前网络。".into(),
         // Keep this distinct from real notification strings so the isolated
         // preview cannot show a system notification to the user.
         Ok("long-error") => "门户提示账号异常，请打开认证页面检查；演示状态：这是一条较长的恢复提示，用于检查换行和内容布局。".into(),

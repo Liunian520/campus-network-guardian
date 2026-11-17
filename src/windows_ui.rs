@@ -1172,7 +1172,7 @@ mod win {
         MessageBoxW(h, wide(msg).as_ptr(), wide("校园网守护").as_ptr(), 0x30);
     }
     fn application_version() -> &'static str {
-        option_env!("CARGO_PKG_VERSION").unwrap_or("0.4.1")
+        option_env!("CARGO_PKG_VERSION").unwrap_or("0.5.0")
     }
     unsafe fn show_about(h: Handle) {
         let message = format!(
@@ -3037,7 +3037,7 @@ mod win {
             control(
                 h,
                 "STATIC",
-                "无线请先连接校园 Wi-Fi；\r\n列表缺失时检查 Windows 位置权限。",
+                "无线先连校园 Wi-Fi，再选择网卡。\r\n自动关闭随机 MAC；必要时等待重连。",
                 0,
                 308,
                 96,

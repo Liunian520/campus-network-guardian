@@ -6,6 +6,7 @@ use campus_network_guardian::{
     controller::{Action, Controller},
     network,
     portal::{PortalClient, PortalError},
+    wifi_mac,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -115,6 +116,21 @@ fn startup_controller(
     controller
 }
 
+fn worker_wait(
+    now: Instant,
+    next: Instant,
+    connected: bool,
+    mac_retry_at: Option<Instant>,
+) -> Duration {
+    if connected {
+        next.max(mac_retry_at.unwrap_or(next))
+            .saturating_duration_since(now)
+            .min(Duration::from_secs(5))
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
 #[cfg(test)]
 mod startup_tests {
     use super::*;
@@ -139,6 +155,10 @@ mod startup_tests {
         let now = Instant::now();
         let config = fake_config();
         let mut controller = startup_controller(now, Some(&config), |_| Ok(None));
+        assert!(
+            !controller.configuration_available(),
+            "missing credentials must also block Wi-Fi profile writes"
+        );
         assert_eq!(
             controller.on_status(now, Ok(PortalStatus::Online(DialState::Failed))),
             Action::None
@@ -148,6 +168,7 @@ mod startup_tests {
             Action::None
         );
         controller.configured(now);
+        assert!(controller.configuration_available());
         assert_eq!(
             controller.on_status(now, Ok(PortalStatus::Online(DialState::Failed))),
             Action::Redial
@@ -202,6 +223,25 @@ mod startup_tests {
         );
         let _ = startup_controller(now, None, |_| panic!("must not read credentials"));
     }
+
+    #[test]
+    fn mac_wait_and_network_settling_never_turn_into_a_busy_poll_loop() {
+        let now = Instant::now();
+        let expired = now - Duration::from_secs(1);
+        let settling = now + Duration::from_secs(5);
+        assert_eq!(
+            worker_wait(now, expired, true, Some(settling)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            worker_wait(now, settling, true, Some(expired)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            worker_wait(now, expired, false, Some(expired)),
+            Duration::from_secs(5)
+        );
+    }
 }
 
 fn worker(
@@ -217,16 +257,16 @@ fn worker(
         display(&status, controller.message());
     }
     let mut last_connection: Option<network::NetworkConnection> = None;
+    let mut mac_guard = wifi_mac::Guard::default();
+    let mut mac_retry_at: Option<Instant> = None;
     let mut applied_generation = generation.load(Ordering::SeqCst);
     loop {
-        let timeout = if last_connection.is_some() {
-            controller
-                .next()
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(5))
-        } else {
-            Duration::from_secs(5)
-        };
+        let timeout = worker_wait(
+            Instant::now(),
+            controller.next(),
+            last_connection.is_some(),
+            mac_retry_at,
+        );
         match rx.recv_timeout(timeout) {
             Ok(Event::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Event::SettingsSaved(settings, reply)) => {
@@ -247,6 +287,8 @@ fn worker(
                         controller.configured(Instant::now());
                         applied_generation = generation.load(Ordering::SeqCst);
                         last_connection = None;
+                        mac_guard = wifi_mac::Guard::default();
+                        mac_retry_at = None;
                         let _ = reply.send(Ok(()));
                     } else {
                         controller.credentials_deleted();
@@ -271,9 +313,11 @@ fn worker(
             Ok(Event::NetworkChanged(event_generation)) => {
                 applied_generation = event_generation;
                 last_connection = None;
+                mac_retry_at = None;
                 controller.network_changed(Instant::now());
             }
             Ok(Event::CheckNow) => {
+                mac_retry_at = None;
                 controller.check_now(Instant::now());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -285,15 +329,50 @@ fn worker(
         let connection = network::matched_connection(&saved.identity).ok().flatten();
         if connection != last_connection {
             last_connection = connection;
+            mac_retry_at = None;
             controller.network_changed(Instant::now());
         }
         let Some(connection) = connection else {
+            mac_retry_at = None;
             display(&status, "校园网络不匹配或不可用，已暂停");
             continue;
         };
         if !controller.due(Instant::now()) {
             continue;
         }
+        if mac_retry_at.is_some_and(|next| Instant::now() < next) {
+            continue;
+        }
+        if !controller.configuration_available() {
+            display(&status, controller.message());
+            mac_retry_at = Some(Instant::now() + Duration::from_secs(30));
+            continue;
+        }
+        // Profile changes are serialized with UI configuration invalidation. The
+        // WLAN backend also rechecks the selected identity immediately before writing.
+        let readiness = match gate.lock() {
+            Ok(_lock) if generation.load(Ordering::SeqCst) == applied_generation => {
+                mac_guard.prepare(&saved.identity, connection)
+            }
+            _ => wifi_mac::Readiness::Manual(wifi_mac::Error::Changed),
+        };
+        if readiness != wifi_mac::Readiness::Ready {
+            display(&status, readiness.message());
+            mac_retry_at = Some(
+                Instant::now()
+                    + Duration::from_secs(
+                        if matches!(readiness, wifi_mac::Readiness::WaitingForReconnect) {
+                            5
+                        } else {
+                            30
+                        },
+                    ),
+            );
+            continue;
+        }
+        mac_retry_at = None;
+        let mac_proof = mac_guard.proof();
+        let post_mac_proof = mac_proof.clone();
         let identity = saved.identity.clone();
         let current_generation = Arc::clone(&generation);
         let post_gate = Arc::clone(&gate);
@@ -303,6 +382,7 @@ fn worker(
             move || {
                 current_generation.load(Ordering::SeqCst) == applied_generation
                     && network::matched_connection(&identity).ok().flatten() == Some(connection)
+                    && wifi_mac::authentication_ready(&identity, connection, &post_mac_proof)
             },
             post_gate,
         );
@@ -316,7 +396,9 @@ fn worker(
         if !matches!(action, Action::Login | Action::Redial) {
             continue;
         }
-        if network::matched_connection(&saved.identity).ok().flatten() != Some(connection) {
+        if network::matched_connection(&saved.identity).ok().flatten() != Some(connection)
+            || !wifi_mac::authentication_ready(&saved.identity, connection, &mac_proof)
+        {
             controller.network_changed(Instant::now());
             display(&status, controller.message());
             last_connection = None;

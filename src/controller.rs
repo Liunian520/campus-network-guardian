@@ -46,6 +46,10 @@ impl Controller {
     pub fn next(&self) -> Instant {
         self.next
     }
+    /// Whether saved settings permit any automatic operating-system changes.
+    pub fn configuration_available(&self) -> bool {
+        self.hold != Hold::Configuration
+    }
     pub fn message(&self) -> &'static str {
         if self.hold == Hold::None {
             self.message
