@@ -7,6 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'inno-compiler.ps1')
+. (Join-Path $PSScriptRoot 'windows-binary-version.ps1')
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $manifestPath = Join-Path $repositoryRoot 'Cargo.toml'
@@ -83,6 +84,10 @@ try {
     $applicationPath = Join-Path $buildDirectory "$rustTarget\release\campus-network-guardian.exe"
     if (-not (Test-Path -LiteralPath $applicationPath -PathType Leaf)) {
         throw "Rust build did not produce $applicationPath."
+    }
+    $binaryVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($applicationPath)
+    if (-not (Test-WindowsBinaryVersion -VersionInfo $binaryVersion -ExpectedVersion $applicationVersion)) {
+        throw "Windows executable version '$($binaryVersion.ProductVersion)' does not match Cargo $applicationVersion."
     }
 
     $compilerArguments = @(
