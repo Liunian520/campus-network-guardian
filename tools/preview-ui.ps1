@@ -14,9 +14,11 @@ param(
     [string]$Page = 'all',
     [ValidateSet(96, 120, 144, 192)]
     [int]$Dpi = 96,
-    [ValidateSet('online', 'waiting', 'wifi-mac', 'long-error', 'very-long')]
+    [ValidateSet('online', 'waiting', 'wifi-mac', 'long-error', 'very-long', 'dual')]
     [string]$Status = 'online',
     [string]$ResourceLibrary,
+    [ValidateRange(0, 8192)]
+    [int]$WorkAreaWidth = 0,
     [int]$WindowHeight = 0,
     [switch]$ScrollBottom,
     [switch]$ClientOnly,
@@ -75,13 +77,15 @@ fn main() {
         unsafe { EnumWindows(close_preview_window, std::process::id() as isize); }
     });
     let (tx, _rx) = mpsc::channel();
-    let status: String = match std::env::var("CAMPUS_PREVIEW_STATUS").as_deref() {
+    let selected_status = std::env::var("CAMPUS_PREVIEW_STATUS");
+    let status: String = match selected_status.as_deref() {
         Ok("waiting") => "网络已变化，正在等待网络稳定".into(),
         Ok("wifi-mac") => "校园 Wi-Fi 随机 MAC 已关闭；等待下次连接后确认固定地址。自动认证暂缓，不主动断开当前网络。".into(),
         // Keep this distinct from real notification strings so the isolated
         // preview cannot show a system notification to the user.
         Ok("long-error") => "门户提示账号异常，请打开认证页面检查；演示状态：这是一条较长的恢复提示，用于检查换行和内容布局。".into(),
         Ok("very-long") => "门户提示账号异常，请打开认证页面检查；演示状态：这是一条较长的恢复提示，用于检查换行和内容布局。".repeat(12),
+        Ok("dual") => "Wi-Fi：校园网在线\r\n以太网：校园网络不匹配或不可用，已暂停\r\n系统选路：WHUT-ISP 可用，等待以太网".into(),
         _ => "校园网在线".into(),
     };
     let adapter_name = if std::env::var("CAMPUS_PREVIEW_UNBROKEN_ADAPTER").as_deref() == Ok("1") {
@@ -96,7 +100,7 @@ fn main() {
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
-            secondary_adapter_id: String::new(),
+            secondary_adapter_id: if selected_status.as_deref() == Ok("dual") { "preview-alternative".into() } else { String::new() },
             username: "demo-campus".into(),
             http_acknowledged: true,
             autostart: false,
@@ -444,6 +448,13 @@ function Test-PreviewValidation([IntPtr]$Window) {
         $beforePasswordLength = [GuardianPreviewNative]::SendMessage($password, 0xe, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
         $beforeAdapter = [GuardianPreviewNative]::SendMessage($combo, 0x147, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
         $beforeConsent = [GuardianPreviewNative]::SendMessage($consent, 0xf0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+        $adapterDetail = [GuardianPreviewNative]::GetDlgItem($Window, 134)
+        $networkTitle = [GuardianPreviewNative]::GetDlgItem($Window, 125)
+        $detailBounds = [GuardianPreviewNative+Rect]::new()
+        $networkBounds = [GuardianPreviewNative+Rect]::new()
+        [GuardianPreviewNative]::GetWindowRect($adapterDetail, [ref]$detailBounds) | Out-Null
+        [GuardianPreviewNative]::GetWindowRect($networkTitle, [ref]$networkBounds) | Out-Null
+        $detailOffset = $detailBounds.Top - $networkBounds.Top
         if ($beforeUser -ne $scenario.User -or $beforePasswordLength -ne $scenario.Password.Length -or $beforeAdapter -ne $scenario.Adapter -or $beforeConsent -ne $scenario.Consent) {
             throw "Fake preconditions for '$($scenario.Name)' were not applied; no Save attempted. User='$beforeUser'; passwordLength=$beforePasswordLength; adapter=$beforeAdapter; consent=$beforeConsent; setUser=$setUser; setPassword=$setPassword."
         }
@@ -451,6 +462,11 @@ function Test-PreviewValidation([IntPtr]$Window) {
         Start-Sleep -Milliseconds 70
         $feedback = Read-PreviewControl $Window 131
         if ($feedback -notmatch $scenario.Error) { throw "Inline feedback for '$($scenario.Name)' did not explain the invalid field: $feedback" }
+        [GuardianPreviewNative]::GetWindowRect($adapterDetail, [ref]$detailBounds) | Out-Null
+        [GuardianPreviewNative]::GetWindowRect($networkTitle, [ref]$networkBounds) | Out-Null
+        if ($detailBounds.Top - $networkBounds.Top -ne $detailOffset) {
+            throw "Validation '$($scenario.Name)' displaced the adapter detail from its card."
+        }
         $focus = [GuardianPreviewNative]::PreviewFocus($Window)
         $focusId = [GuardianPreviewNative]::GetDlgCtrlID($focus)
         $afterPasswordLength = [GuardianPreviewNative]::SendMessage($password, 0xe, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
@@ -459,6 +475,19 @@ function Test-PreviewValidation([IntPtr]$Window) {
             throw "Validation '$($scenario.Name)' discarded an unsaved fake field."
         }
         if (-not [GuardianPreviewNative]::IsWindowVisible($save)) { throw "Validation '$($scenario.Name)' unexpectedly left the settings page." }
+        if ($WindowHeight -gt 0) {
+            $client = [GuardianPreviewNative+Rect]::new()
+            $error = [GuardianPreviewNative+Rect]::new()
+            $field = [GuardianPreviewNative+Rect]::new()
+            [GuardianPreviewNative]::GetClientRect($Window, [ref]$client) | Out-Null
+            [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$client, 2) | Out-Null
+            [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($Window, 131), [ref]$error) | Out-Null
+            [GuardianPreviewNative]::GetWindowRect($focus, [ref]$field) | Out-Null
+            if ($error.Top -lt $client.Top -or $error.Bottom -gt $client.Bottom -or
+                $field.Top -lt $client.Top -or $field.Bottom -gt $client.Bottom) {
+                throw "Validation '$($scenario.Name)' did not keep the message and its focused field visible in the short window."
+            }
+        }
         $report.Add("Inline validation '$($scenario.Name)' explains the error, focuses field $focusId, and preserves fake form input.")
     }
     # Leave the last invalid scenario in place for the validation screenshot.
@@ -491,6 +520,7 @@ function Save-PreviewWindow([IntPtr]$Window, [string]$Destination) {
 $previewProcess = $null
 $previewWindow = [IntPtr]::Zero
 $priorDpi = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI')
+$priorWidth = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH')
 $priorStatus = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_STATUS')
 $priorError = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_ERROR')
 $priorLongAdapter = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER')
@@ -499,6 +529,7 @@ $errorPath = Join-Path $captureDir 'error.txt'
 $priorDpiContext = [GuardianPreviewNative]::SetThreadDpiAwarenessContext([IntPtr](-4))
 try {
     $env:CAMPUS_UI_PREVIEW_DPI = [string]$Dpi
+    $env:CAMPUS_UI_PREVIEW_WORK_WIDTH = [string]$WorkAreaWidth
     $env:CAMPUS_PREVIEW_STATUS = $Status
     $env:CAMPUS_PREVIEW_ERROR = $errorPath
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $(if ($LongAdapter) { '1' } else { $null }))
@@ -514,6 +545,13 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if ($previewWindow -eq [IntPtr]::Zero) { throw 'Preview window was not found within five seconds.' }
+    if ($WorkAreaWidth -gt 0) {
+        $widthRect = [GuardianPreviewNative+Rect]::new()
+        [GuardianPreviewNative]::GetWindowRect($previewWindow, [ref]$widthRect) | Out-Null
+        $previewWidth = $widthRect.Right - $widthRect.Left
+        if ($previewWidth -gt $WorkAreaWidth) { throw "Preview window width $previewWidth exceeds its $WorkAreaWidth px work area." }
+        Write-Output "Preview window width $previewWidth px fits the $WorkAreaWidth px work area at $Dpi DPI."
+    }
     # No focus or real screen capture. A real window must have WS_VISIBLE for
     # every child to render via WM_PRINT; keep it beyond all monitor bounds.
     [GuardianPreviewNative]::SetWindowPos($previewWindow, [IntPtr]::Zero, -20000, -20000, 0, 0, 0x15) | Out-Null
@@ -537,6 +575,15 @@ try {
             Write-Warning 'This UI source has no overview navigation yet; captured the available page.'
         }
         Start-Sleep -Milliseconds 200
+        if ($capturePage -eq 'overview' -and $Status -eq 'dual' -and $WindowHeight -ge 650) {
+            $bounds = [GuardianPreviewNative+Rect]::new()
+            $action = [GuardianPreviewNative+Rect]::new()
+            [GuardianPreviewNative]::GetClientRect($previewWindow, [ref]$bounds) | Out-Null
+            [GuardianPreviewNative]::MapWindowPoints($previewWindow, [IntPtr]::Zero, [ref]$bounds, 2) | Out-Null
+            [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($previewWindow, 201), [ref]$action) | Out-Null
+            if ($action.Bottom -gt $bounds.Bottom) { throw 'The overview check action is clipped before scrolling.' }
+            Write-Output 'The overview check action is fully visible on the short screen.'
+        }
         if ($ScrollBottom) {
             [GuardianPreviewNative]::SendMessage($previewWindow, 0x115, [IntPtr]7, [IntPtr]::Zero) | Out-Null
             Start-Sleep -Milliseconds 100
@@ -575,6 +622,7 @@ try {
     }
 } finally {
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI', $priorDpi)
+    [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH', $priorWidth)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_STATUS', $priorStatus)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_ERROR', $priorError)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $priorLongAdapter)

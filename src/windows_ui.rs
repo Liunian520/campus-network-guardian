@@ -5,6 +5,40 @@ mod theme;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tray_callbacks_preserve_legacy_and_accept_keyboard_activation() {
+        use super::{tray_action, TrayAction};
+        assert_eq!(tray_action(1, 0x203), Some(TrayAction::Open));
+        assert_eq!(
+            tray_action(1, 0x205),
+            Some(TrayAction::Menu { use_icon: false })
+        );
+        assert_eq!(tray_action(0, 0x1_0401), Some(TrayAction::Open));
+        assert_eq!(
+            tray_action(0, 0x1_007b),
+            Some(TrayAction::Menu { use_icon: true })
+        );
+        assert_eq!(tray_action(0, 0x2_0401), None);
+        assert_eq!(tray_action(2, 0x205), None);
+        assert_eq!(tray_action(0, 0x1_0205), None);
+    }
+    #[test]
+    fn panel_width_fits_a_1280_pixel_work_area_at_200_percent() {
+        let panel = super::PanelWidth::fit(1280, 56, 192);
+        assert!(super::scale_for_dpi(panel.width, 192) + 56 <= 1280);
+        assert!(panel.x(192) > panel.sidebar);
+        assert!(panel.x(736) < panel.width);
+        assert!(panel.content_span(240) >= 150);
+    }
+
+    #[test]
+    fn full_width_keeps_normal_window_geometry() {
+        let panel = super::PanelWidth::fit(1920, 24, 144);
+        assert_eq!(panel.width, 760);
+        for x in [0, 12, 168, 192, 476, 736, 760] {
+            assert_eq!(panel.x(x), x);
+        }
+    }
+    #[test]
     fn tray_menu_summarizes_networks_without_expanding_to_full_status_text() {
         assert_eq!(
             super::connection_heading(
@@ -16,7 +50,13 @@ mod tests {
             super::connection_heading(
                 "Wi-Fi：校园网在线\r\n以太网：校园网络不匹配或不可用，已暂停"
             ),
-            "连接需要关注"
+            "部分网络已连接"
+        );
+        assert_eq!(
+            super::connection_heading(
+                "Wi-Fi：需要人工处理验证码，请打开认证页面\r\n以太网：校园网在线\r\n系统选路：以太网兜底"
+            ),
+            "部分网络已连接"
         );
     }
 
@@ -68,13 +108,13 @@ mod tests {
         );
         assert_eq!(
             super::connection_tone("Wi-Fi：校园网在线\r\n以太网：正在等待认证或运营商拨号结果"),
-            super::ConnectionTone::Pending
+            super::ConnectionTone::Partial
         );
         assert_eq!(
             super::connection_tone(
                 "Wi-Fi：校园网在线\r\n以太网：门户未接受登录，请打开认证页面检查"
             ),
-            super::ConnectionTone::Attention
+            super::ConnectionTone::Partial
         );
     }
     #[test]
@@ -97,7 +137,7 @@ mod tests {
         );
         assert_eq!(
             super::connection_tone(&format!("{offline}\r\n{route}")),
-            super::ConnectionTone::Pending,
+            super::ConnectionTone::Partial,
         );
         assert_eq!(
             super::connection_tone(route),
@@ -230,6 +270,30 @@ mod tests {
         assert_eq!(disconnected.len(), 2);
         assert_eq!(disconnected[0].id, "known-wifi");
         assert_eq!(disconnected[1].id, "known-ethernet");
+    }
+
+    #[test]
+    fn overview_labels_follow_the_current_adapter_snapshot() {
+        let settings = super::Settings {
+            adapter_id: "wifi-id".into(),
+            secondary_adapter_id: "ethernet-id".into(),
+            ..Default::default()
+        };
+        let wifi = super::Adapter {
+            id: "wifi-id".into(),
+            name: "Wi-Fi / WHUT-ISP".into(),
+        };
+        let ethernet = super::Adapter {
+            id: "ethernet-id".into(),
+            name: "以太网".into(),
+        };
+        let (only_wifi, _) = super::overview_network_text(&settings, std::slice::from_ref(&wifi));
+        assert_eq!(
+            only_wifi,
+            "主网络　Wi-Fi / WHUT-ISP\r\n第二个网络　已保存，当前不可用"
+        );
+        let (both, _) = super::overview_network_text(&settings, &[wifi, ethernet]);
+        assert_eq!(both, "主网络　Wi-Fi / WHUT-ISP\r\n第二个网络　以太网");
     }
 
     #[test]
@@ -369,14 +433,20 @@ mod tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionTone {
     Online,
+    Partial,
     Attention,
     Pending,
 }
 fn connection_tone(status: &str) -> ConnectionTone {
-    let mut messages = campus_status_lines(status).map(status_message);
-    if messages.next() == Some("校园网在线") && messages.all(|message| message == "校园网在线")
-    {
+    let (online, total) = campus_status_lines(status)
+        .map(status_message)
+        .fold((0, 0), |(online, total), message| {
+            (online + usize::from(message == "校园网在线"), total + 1)
+        });
+    if online != 0 && online == total {
         ConnectionTone::Online
+    } else if online != 0 {
+        ConnectionTone::Partial
     } else if should_notify("", status)
         || campus_status_lines(status).any(|line| {
             line.contains("暂停")
@@ -398,6 +468,7 @@ fn campus_status_lines(status: &str) -> impl Iterator<Item = &str> {
 fn connection_heading(status: &str) -> &'static str {
     match connection_tone(status) {
         ConnectionTone::Online => "校园网已连接",
+        ConnectionTone::Partial => "部分网络已连接",
         ConnectionTone::Attention => "连接需要关注",
         ConnectionTone::Pending => "正在确认连接",
     }
@@ -489,6 +560,44 @@ fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
     ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
 }
 
+#[derive(Clone, Copy)]
+struct PanelWidth {
+    width: i32,
+    sidebar: i32,
+}
+
+impl PanelWidth {
+    const STANDARD: Self = Self {
+        width: 760,
+        sidebar: theme::SIDEBAR_WIDTH,
+    };
+
+    fn fit(work_width: i32, chrome_width: i32, dpi: u32) -> Self {
+        let width = ((i64::from((work_width - chrome_width).max(1)) * 96) / i64::from(dpi)) as i32;
+        let width = width.clamp(1, Self::STANDARD.width);
+        let sidebar = if width >= 680 {
+            168
+        } else if width >= 540 {
+            144
+        } else {
+            128.min(width / 3)
+        };
+        Self { width, sidebar }
+    }
+
+    fn x(self, x: i32) -> i32 {
+        if x <= Self::STANDARD.sidebar {
+            x * self.sidebar / Self::STANDARD.sidebar
+        } else {
+            self.sidebar + self.content_span(x - Self::STANDARD.sidebar)
+        }
+    }
+
+    fn content_span(self, width: i32) -> i32 {
+        width * (self.width - self.sidebar) / (Self::STANDARD.width - Self::STANDARD.sidebar)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Adapter {
     pub id: String,
@@ -503,6 +612,55 @@ pub struct Settings {
     pub autostart: bool,
 }
 const DISCONNECTED_LABEL: &str = "（当前未连接）";
+const TRAY_ICON_ID: u32 = 1;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+#[derive(Debug, PartialEq, Eq)]
+enum TrayAction {
+    Open,
+    Menu { use_icon: bool },
+}
+fn tray_action(icon_or_anchor: usize, packed: isize) -> Option<TrayAction> {
+    const WM_RBUTTONUP: u32 = 0x0205;
+    const WM_CONTEXTMENU: u32 = 0x007b;
+    const NIN_KEYSELECT: u32 = 0x0401;
+    let packed = packed as u32;
+    let icon_id = packed >> 16;
+    match (icon_id, packed & 0xffff) {
+        (TRAY_ICON_ID, WM_CONTEXTMENU) => Some(TrayAction::Menu { use_icon: true }),
+        (TRAY_ICON_ID, NIN_KEYSELECT | WM_LBUTTONDBLCLK) => Some(TrayAction::Open),
+        (0, WM_LBUTTONDBLCLK) if icon_or_anchor == TRAY_ICON_ID as usize => Some(TrayAction::Open),
+        (0, WM_RBUTTONUP) if icon_or_anchor == TRAY_ICON_ID as usize => {
+            Some(TrayAction::Menu { use_icon: false })
+        }
+        _ => None,
+    }
+}
+fn overview_network_text(settings: &Settings, adapters: &[Adapter]) -> (String, String) {
+    const UNAVAILABLE: &str = "已保存，当前不可用";
+    let name = |id: &str| {
+        adapters
+            .iter()
+            .find(|adapter| adapter.id == id)
+            .map(|adapter| adapter.name.as_str())
+    };
+    let primary = name(&settings.adapter_id).unwrap_or(if settings.adapter_id.is_empty() {
+        "尚未选择校园网络"
+    } else {
+        UNAVAILABLE
+    });
+    if settings.secondary_adapter_id.is_empty() {
+        primary
+            .rsplit_once(" / 网关 ")
+            .map(|(network, gateway)| (network.to_owned(), format!("网关 {gateway}")))
+            .unwrap_or_else(|| (primary.into(), "仅在匹配所选网络时执行认证".into()))
+    } else {
+        let secondary = name(&settings.secondary_adapter_id).unwrap_or(UNAVAILABLE);
+        (
+            format!("主网络　{primary}\r\n第二个网络　{secondary}"),
+            "仅在匹配所选网络时执行认证".into(),
+        )
+    }
+}
 fn adapter_options(
     mut connected: Vec<Adapter>,
     saved: &Settings,
@@ -562,12 +720,13 @@ mod win {
     use super::theme;
     use super::{
         adapter_options, autostart_value_matches, connection_heading, copy_utf16,
-        matches_terminated_username, notify_network_change, notify_quit, scale_for_dpi,
-        settings_allowed, settings_failure_message, settings_transaction, should_notify, Adapter,
-        Event, Settings, DISCONNECTED_LABEL,
+        matches_terminated_username, notify_network_change, notify_quit, overview_network_text,
+        scale_for_dpi, settings_allowed, settings_failure_message, settings_transaction,
+        should_notify, Adapter, Event, PanelWidth, Settings,
     };
+    use super::{tray_action, TrayAction, TRAY_ICON_ID, WM_LBUTTONDBLCLK};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         ffi::c_void,
         mem::{size_of, zeroed},
         os::windows::ffi::OsStrExt,
@@ -585,6 +744,17 @@ mod win {
     const PORTAL: &str = "http://172.30.21.100/";
     const AUTHOR_URL: &str = "https://github.com/Liunian520";
     const TRAY: u32 = 0x8001;
+    const NIM_ADD: u32 = 0;
+    const NIM_MODIFY: u32 = 1;
+    const NIM_DELETE: u32 = 2;
+    const NIM_SETFOCUS: u32 = 3;
+    const NIM_SETVERSION: u32 = 4;
+    const NIF_MESSAGE: u32 = 0x01;
+    const NIF_ICON: u32 = 0x02;
+    const NIF_TIP: u32 = 0x04;
+    const NIF_INFO: u32 = 0x10;
+    const NIF_SHOWTIP: u32 = 0x80;
+    const NOTIFYICON_VERSION_4: u32 = 4;
     const WM_DESTROY: u32 = 2;
     const WM_CLOSE: u32 = 0x10;
     const WM_COMMAND: u32 = 0x111;
@@ -599,8 +769,6 @@ mod win {
     const WM_VSCROLL: u32 = 0x115;
     const WM_MOUSEWHEEL: u32 = 0x20a;
     const WM_SIZE: u32 = 5;
-    const WM_RBUTTONUP: u32 = 0x205;
-    const WM_LBUTTONDBLCLK: u32 = 0x203;
     const C_ADAPTER: usize = 101;
     const C_USER: usize = 102;
     const C_PASS: usize = 103;
@@ -643,10 +811,13 @@ mod win {
     const M_SETTINGS: usize = 202;
     const M_OPEN: usize = 203;
     const M_QUIT: usize = 204;
+    const M_TRAY_PANEL: usize = 205;
     const WS_CHILD: u32 = 0x40000000;
     const WS_VISIBLE: u32 = 0x10000000;
     const WS_TABSTOP: u32 = 0x10000;
     const CONTENT_HEIGHT: i32 = 600;
+    const COMPACT_OVERVIEW_HEIGHT: i32 = 360;
+    const COMPACT_OVERVIEW_SHIFT: i32 = 32;
     const NETWORK_FIELD_ROW_HEIGHT: i32 = 24;
     const ADAPTER_COMBO_WIDTH: i32 = 220;
     const HKEY_CURRENT_USER: Handle = 0x80000001u32 as i32 as isize;
@@ -757,11 +928,18 @@ mod win {
         state: u32,
         state_mask: u32,
         info: [u16; 256],
-        timeout: u32,
+        version_or_timeout: u32,
         info_title: [u16; 64],
         info_flags: u32,
         guid: Guid,
         balloon: Handle,
+    }
+    #[repr(C)]
+    struct NotifyIconIdentifier {
+        size: u32,
+        hwnd: Handle,
+        id: u32,
+        guid: Guid,
     }
     #[repr(C)]
     struct FileTime {
@@ -786,6 +964,13 @@ mod win {
     #[link(name = "user32")]
     extern "system" {
         fn RegisterClassW(c: *const WndClass) -> u16;
+        fn RegisterWindowMessageW(name: *const u16) -> u32;
+        fn ChangeWindowMessageFilterEx(
+            h: Handle,
+            message: u32,
+            action: u32,
+            filter: *mut c_void,
+        ) -> i32;
         fn CreateWindowExW(
             ex: u32,
             class: *const u16,
@@ -807,6 +992,7 @@ mod win {
         fn TranslateMessage(m: *const Msg) -> i32;
         fn DispatchMessageW(m: *const Msg) -> isize;
         fn ShowWindow(h: Handle, n: i32) -> i32;
+        fn IsWindowVisible(h: Handle) -> i32;
         fn SetForegroundWindow(h: Handle) -> i32;
         fn DestroyWindow(h: Handle) -> i32;
         fn PostQuitMessage(code: i32);
@@ -880,6 +1066,7 @@ mod win {
     #[link(name = "shell32")]
     extern "system" {
         fn Shell_NotifyIconW(msg: u32, data: *mut Notify) -> i32;
+        fn Shell_NotifyIconGetRect(icon: *const NotifyIconIdentifier, rect: *mut Rect) -> i32;
         fn ShellExecuteW(
             h: Handle,
             op: *const u16,
@@ -1029,7 +1216,12 @@ mod win {
         unsafe {
             let window = FindWindowW(wide("CampusNetworkGuardianWindow").as_ptr(), null());
             if window != 0 {
-                PostMessageW(window, TRAY, 1, WM_LBUTTONDBLCLK as isize);
+                PostMessageW(
+                    window,
+                    TRAY,
+                    TRAY_ICON_ID as usize,
+                    WM_LBUTTONDBLCLK as isize,
+                );
             }
         }
     }
@@ -1276,7 +1468,8 @@ mod win {
         tx: Sender<Event>,
         status: Arc<Mutex<String>>,
         tray: RefCell<Notify>,
-        tray_available: bool,
+        tray_available: Cell<bool>,
+        taskbar_created: u32,
         last_status: RefCell<String>,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
@@ -1302,6 +1495,7 @@ mod win {
     // The UI is system-DPI aware; Windows scales the window if moved to a monitor
     // with a different DPI. All values here are confined to the UI thread.
     static mut UI_DPI: u32 = 96;
+    static mut PANEL_WIDTH: PanelWidth = PanelWidth::STANDARD;
     static mut UI_FONT: Handle = 0;
     static mut TITLE_FONT: Handle = 0;
     static mut SECTION_FONT: Handle = 0;
@@ -1319,10 +1513,26 @@ mod win {
     static mut HOVERED_BUTTON: Handle = 0;
     static mut HERO_EXTRA: i32 = 0;
     static mut NETWORK_TEXT_HEIGHT: i32 = 28;
+    static mut NETWORK_DETAIL_HEIGHT: i32 = 20;
     static mut OVERVIEW_HEIGHT: i32 = CONTENT_HEIGHT;
     static mut FORM_SHIFT: i32 = 0;
     static mut FORM_NETWORK_EXTRA: i32 = NETWORK_FIELD_ROW_HEIGHT;
     static mut FORM_ERROR_FIELD: usize = 0;
+    #[derive(Clone, Copy)]
+    struct FormWrap {
+        account: i32,
+        consent: i32,
+        http_hint: i32,
+        startup: i32,
+        automation: i32,
+    }
+    static mut FORM_WRAP: FormWrap = FormWrap {
+        account: 0,
+        consent: 0,
+        http_hint: 0,
+        startup: 0,
+        automation: 0,
+    };
     unsafe fn app() -> Option<&'static App> {
         APP.as_ref()
     }
@@ -1398,9 +1608,9 @@ mod win {
                 } else {
                     0
                 },
-            scale_for_dpi(x, UI_DPI),
+            scale_for_dpi(PANEL_WIDTH.x(x), UI_DPI),
             scale_for_dpi(y, UI_DPI),
-            scale_for_dpi(w, UI_DPI),
+            scale_for_dpi((PANEL_WIDTH.x(x + w) - PANEL_WIDTH.x(x)).max(1), UI_DPI),
             scale_for_dpi(height, UI_DPI),
             h,
             id as isize,
@@ -1603,7 +1813,7 @@ mod win {
             return value.to_owned();
         }
         let old = SelectObject(dc, font);
-        let available = scale_for_dpi(width, UI_DPI);
+        let available = scale_for_dpi(PANEL_WIDTH.content_span(width).max(1), UI_DPI);
         let mut output = String::new();
         // DrawText word wrapping can leave an unbroken ASCII device name on
         // one oversized line. Insert display-only breaks in those runs; keep
@@ -1641,7 +1851,7 @@ mod win {
         let mut bounds = Rect {
             left: 0,
             top: 0,
-            right: scale_for_dpi(width, UI_DPI),
+            right: scale_for_dpi(PANEL_WIDTH.content_span(width).max(1), UI_DPI),
             bottom: 0,
         };
         DrawTextW(
@@ -1672,11 +1882,20 @@ mod win {
         });
     }
     unsafe fn update_overview_layout(h: Handle) {
-        let status_height = measured_height(h, &text(h, C_STATUS), UI_FONT, 472).clamp(44, 100);
+        let viewport = viewport_height(h);
+        let status_limit = if viewport < COMPACT_OVERVIEW_HEIGHT {
+            (viewport - 228).clamp(44, 100)
+        } else {
+            100
+        };
+        let status_height =
+            measured_height(h, &text(h, C_STATUS), UI_FONT, 472).clamp(44, status_limit);
         HERO_EXTRA = status_height - 44;
         NETWORK_TEXT_HEIGHT = measured_height(h, &text(h, C_NETWORK_VALUE), UI_FONT, 496).max(28);
+        NETWORK_DETAIL_HEIGHT =
+            measured_height(h, &text(h, C_NETWORK_DESC), SMALL_FONT, 496).max(20);
         let network_y = 320 + HERO_EXTRA;
-        let network_height = 96 + NETWORK_TEXT_HEIGHT;
+        let network_height = 76 + NETWORK_TEXT_HEIGHT + NETWORK_DETAIL_HEIGHT;
         set_control_bounds(C_STATUS, 216, 180, 496, status_height);
         set_control_bounds(M_CHECK, 192, 256 + HERO_EXTRA, 144, 40);
         set_control_bounds(M_OPEN, 352, 256 + HERO_EXTRA, 176, 40);
@@ -1693,7 +1912,7 @@ mod win {
             216,
             network_y + 56 + NETWORK_TEXT_HEIGHT,
             496,
-            20,
+            NETWORK_DETAIL_HEIGHT,
         );
         let notice = text(h, C_OVERVIEW_HINT);
         let notice_height = measured_height(h, &notice, SMALL_FONT, 544);
@@ -1712,8 +1931,9 @@ mod win {
             } else {
                 0
             };
-        set_control_bounds(C_FOOTER, 192, footer_y, 544, 44);
-        OVERVIEW_HEIGHT = CONTENT_HEIGHT.max(footer_y + 68);
+        let footer_height = measured_height(h, &text(h, C_FOOTER), SMALL_FONT, 544).max(44);
+        set_control_bounds(C_FOOTER, 192, footer_y, 544, footer_height);
+        OVERVIEW_HEIGHT = CONTENT_HEIGHT.max(footer_y + footer_height + 24);
         layout_controls(h);
         // Keep complete native EDIT lines, with scrolling for unusually long errors.
         let status_control = GetDlgItem(h, C_STATUS as i32);
@@ -1748,6 +1968,26 @@ mod win {
         }
         configure_scroll(h);
     }
+
+    unsafe fn measure_form_text(h: Handle) {
+        let password = measured_height(h, &text(h, C_HINT_PASSWORD), SMALL_FONT, 504).max(20);
+        let consent = measured_height(h, &text(h, C_CONSENT), UI_FONT, 472).max(22);
+        let http = measured_height(h, &text(h, C_HTTP_HINT), SMALL_FONT, 482).max(20);
+        let startup = measured_height(h, &text(h, C_START), UI_FONT, 472).max(22);
+        let startup_hint = measured_height(h, &text(h, C_START_HINT), SMALL_FONT, 482).max(18);
+        FORM_WRAP = FormWrap {
+            account: password - 20,
+            consent: consent - 22,
+            http_hint: http - 20,
+            startup: startup - 22,
+            automation: (consent - 22) + (http - 20) + (startup - 22) + (startup_hint - 18),
+        };
+        set_control_bounds(C_HINT_PASSWORD, 212, 320, 504, password);
+        set_control_bounds(C_CONSENT, 212, 414, 504, consent);
+        set_control_bounds(C_HTTP_HINT, 234, 440, 482, http);
+        set_control_bounds(C_START, 212, 472, 504, startup);
+        set_control_bounds(C_START_HINT, 234, 496, 482, startup_hint);
+    }
     unsafe fn form_feedback(h: Handle, message: &str, field: usize) {
         FORM_ERROR_FIELD = if message.is_empty() { 0 } else { field };
         SetWindowTextW(
@@ -1756,7 +1996,7 @@ mod win {
         );
         let height = measured_height(h, message, SMALL_FONT, 544);
         FORM_SHIFT = if height == 0 { 0 } else { height + 12 };
-        set_control_bounds(C_FORM_FEEDBACK, 192, 88, 544, height);
+        set_control_bounds(C_FORM_FEEDBACK, 192, feedback_section(field), 544, height);
         layout_controls(h);
         configure_scroll(h);
         if field != 0 && !message.is_empty() {
@@ -1764,17 +2004,49 @@ mod win {
         }
         ensure_focus_visible(h);
     }
-    unsafe fn content_height() -> i32 {
+
+    fn feedback_section(field: usize) -> i32 {
+        match field {
+            C_USER | C_PASS => 200,
+            C_CONSENT | C_START => 368,
+            C_SAVE | C_DELETE => 520,
+            _ => 88,
+        }
+    }
+
+    unsafe fn form_feedback_shift(y: i32) -> i32 {
+        if y >= feedback_section(FORM_ERROR_FIELD) {
+            FORM_SHIFT
+        } else {
+            0
+        }
+    }
+    unsafe fn preceding_form_expansion(y: i32) -> i32 {
+        (if y >= 200 { FORM_NETWORK_EXTRA } else { 0 })
+            + if y >= 368 { FORM_WRAP.account } else { 0 }
+            + if y >= 520 { FORM_WRAP.automation } else { 0 }
+    }
+    unsafe fn viewport_height(h: Handle) -> i32 {
+        let mut client: Rect = zeroed();
+        GetClientRect(h, &mut client);
+        ((client.bottom as i64 * 96) / UI_DPI as i64) as i32
+    }
+    unsafe fn content_height(h: Handle) -> i32 {
         if ACTIVE_PAGE == 2 {
-            CONTENT_HEIGHT + FORM_SHIFT + FORM_NETWORK_EXTRA
+            CONTENT_HEIGHT
+                + FORM_SHIFT
+                + FORM_NETWORK_EXTRA
+                + FORM_WRAP.account
+                + FORM_WRAP.automation
+        } else if viewport_height(h) < COMPACT_OVERVIEW_HEIGHT {
+            OVERVIEW_HEIGHT - COMPACT_OVERVIEW_SHIFT
         } else {
             OVERVIEW_HEIGHT
         }
     }
     unsafe fn layout_controls(h: Handle) {
-        let mut client: Rect = zeroed();
-        GetClientRect(h, &mut client);
-        let viewport_height = ((client.bottom as i64 * 96) / UI_DPI as i64) as i32;
+        let viewport_height = viewport_height(h);
+        let compact_overview = viewport_height < COMPACT_OVERVIEW_HEIGHT;
         let compact_sidebar = viewport_height < 328;
         let footer_visible = viewport_height >= 208;
         let footer_top = if compact_sidebar {
@@ -1798,7 +2070,9 @@ mod win {
                 if id == C_AUTHOR {
                     SetWindowTextW(
                         item.hwnd,
-                        wide(if compact_sidebar {
+                        wide(if PANEL_WIDTH.sidebar < 152 {
+                            "Liunian520"
+                        } else if compact_sidebar {
                             "Liunian520 · GitHub"
                         } else {
                             "Liunian520\r\n作者 · GitHub 主页"
@@ -1807,7 +2081,8 @@ mod win {
                     );
                 }
                 let visible = (item.page == 0 || item.page == ACTIVE_PAGE)
-                    && (!matches!(id, C_AUTHOR | C_ABOUT) || footer_visible);
+                    && (!matches!(id, C_AUTHOR | C_ABOUT) || footer_visible)
+                    && !(compact_overview && matches!(id, C_SUBTITLE | C_STATUS_LABEL));
                 ShowWindow(item.hwnd, if visible { 5 } else { 0 });
                 let offset = if item.page == 0 { 0 } else { SCROLL_OFFSET };
                 let y = match id {
@@ -1824,10 +2099,10 @@ mod win {
                     C_AUTHOR | C_ABOUT if compact_sidebar => 24,
                     _ => item.h,
                 };
-                let shift = if item.page == 2
+                let mut shift = if item.page == 2
                     && !matches!(id, C_SETTINGS_TITLE | C_FORM_SUBTITLE | C_FORM_FEEDBACK)
                 {
-                    FORM_SHIFT
+                    form_feedback_shift(if id == C_ADAPTER_DETAIL { 88 } else { item.y })
                         + if item.y >= 200 && id != C_ADAPTER_DETAIL {
                             FORM_NETWORK_EXTRA
                         } else {
@@ -1836,11 +2111,29 @@ mod win {
                 } else {
                     0
                 };
+                if item.page == 2 && item.y >= 368 && id != C_FORM_FEEDBACK {
+                    shift += FORM_WRAP.account;
+                    shift += match id {
+                        C_HTTP_HINT => FORM_WRAP.consent,
+                        C_START => FORM_WRAP.consent + FORM_WRAP.http_hint,
+                        C_START_HINT => FORM_WRAP.consent + FORM_WRAP.http_hint + FORM_WRAP.startup,
+                        C_SAVE | C_DELETE => FORM_WRAP.automation,
+                        _ => 0,
+                    };
+                }
+                if id == C_FORM_FEEDBACK {
+                    shift += preceding_form_expansion(item.y);
+                }
+                if compact_overview && item.page == 1 && id != C_TITLE {
+                    shift -= COMPACT_OVERVIEW_SHIFT;
+                }
+                let left = scale_for_dpi(PANEL_WIDTH.x(item.x), UI_DPI);
+                let right = scale_for_dpi(PANEL_WIDTH.x(item.x + item.w), UI_DPI);
                 MoveWindow(
                     item.hwnd,
-                    scale_for_dpi(item.x, UI_DPI),
+                    left,
                     scale_for_dpi(y + shift, UI_DPI) - offset,
-                    scale_for_dpi(item.w, UI_DPI),
+                    (right - left).max(1),
                     scale_for_dpi(height, UI_DPI),
                     1,
                 );
@@ -1881,6 +2174,8 @@ mod win {
         );
         if page == 2 {
             refresh_adapters(h);
+        } else {
+            update_overview(h);
         }
         scroll_to(h, 0);
         layout_controls(h);
@@ -1917,7 +2212,6 @@ mod win {
                 primary.as_deref().unwrap_or_default(),
                 secondary.as_deref().unwrap_or_default(),
             );
-            update_overview(h);
         }
     }
     unsafe fn chosen_adapter(h: Handle, id: usize, adapters: &[Adapter]) -> Option<&Adapter> {
@@ -1972,7 +2266,6 @@ mod win {
                 settings.autostart as usize,
                 0,
             );
-            update_overview(h);
         }
     }
     unsafe fn update_adapter_detail(h: Handle) {
@@ -1991,7 +2284,10 @@ mod win {
                 let caption = adapter_caption(&adapter.name);
                 (dc == 0
                     || single_line_width(dc, caption)
-                        > scale_for_dpi(ADAPTER_COMBO_WIDTH - 30, UI_DPI))
+                        > scale_for_dpi(
+                            (PANEL_WIDTH.content_span(ADAPTER_COMBO_WIDTH) - 30).max(1),
+                            UI_DPI,
+                        ))
                 .then(|| format!("{label}　{}", adapter.name))
             })
             .collect::<Vec<_>>()
@@ -2013,6 +2309,9 @@ mod win {
         configure_scroll(h);
     }
     unsafe fn update_overview(h: Handle) {
+        if ACTIVE_PAGE != 1 {
+            return;
+        }
         if let Some(app) = app() {
             let status = app
                 .status
@@ -2021,34 +2320,13 @@ mod win {
                 .unwrap_or_else(|_| "状态不可用".into());
             let headline = connection_heading(&status);
             SetWindowTextW(GetDlgItem(h, C_STATUS_HEAD as i32), wide(headline).as_ptr());
+            // The settings list is a draft snapshot, including unavailable
+            // options. Read the current adapters without changing that list.
+            let adapters = (app.adapter_source)();
             let settings = app.settings.borrow();
-            let adapters = app.adapters.borrow();
-            let name = |id: &str| {
-                adapters
-                    .iter()
-                    .find(|a| a.id == id)
-                    .map(|a| a.name.as_str())
-                    .filter(|name| !name.ends_with(DISCONNECTED_LABEL))
-            };
-            let primary = name(&settings.adapter_id).unwrap_or(if settings.adapter_id.is_empty() {
-                "尚未选择校园网络"
-            } else {
-                "已保存"
-            });
             let dual = !settings.secondary_adapter_id.is_empty();
-            let (network, detail) = if dual {
-                let secondary = name(&settings.secondary_adapter_id).unwrap_or("已保存");
-                (
-                    format!("主网络　{primary}\r\n第二个网络　{secondary}"),
-                    "仅在匹配所选网络时执行认证".into(),
-                )
-            } else {
-                primary
-                    .rsplit_once(" / 网关 ")
-                    .map(|(network, gateway)| (network.to_owned(), format!("网关 {gateway}")))
-                    .unwrap_or_else(|| (primary.into(), "仅在匹配所选网络时执行认证".into()))
-            };
-            drop(adapters);
+            let (network, detail) = overview_network_text(&settings, &adapters);
+            drop(settings);
             SetWindowTextW(
                 GetDlgItem(h, C_NETWORK_LABEL as i32),
                 wide(if dual {
@@ -2177,31 +2455,84 @@ mod win {
                         GetDlgItem(h, C_OVERVIEW_HINT as i32),
                         wide("设置已保存。连接状态以最新检查结果为准。").as_ptr(),
                     );
-                    update_overview(h);
                     show_page(h, 1);
                 }
                 Err(e) => report_settings_failure(h, app, &e),
             }
         }
     }
-    unsafe fn menu(h: Handle) {
+    unsafe fn register_tray(tray: &mut Notify) -> bool {
+        tray.flags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        // TaskbarCreated is also sent on some DPI changes where the icon remains.
+        let available =
+            Shell_NotifyIconW(NIM_ADD, tray) != 0 || Shell_NotifyIconW(NIM_MODIFY, tray) != 0;
+        if available {
+            tray.version_or_timeout = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, tray);
+        }
+        available
+    }
+    fn overview_footer(tray_available: bool) -> &'static str {
+        if tray_available {
+            "正常时每 60 秒检查，网络变化后重新确认。\r\n关闭窗口后继续在系统托盘运行。"
+        } else {
+            "正常时每 60 秒检查，网络变化后重新确认。\r\n系统托盘不可用，关闭窗口会退出守护。"
+        }
+    }
+    unsafe fn tray_menu_position(h: Handle, use_icon: bool, right_aligned: bool) -> Point {
+        if use_icon {
+            let mut icon: NotifyIconIdentifier = zeroed();
+            icon.size = size_of::<NotifyIconIdentifier>() as u32;
+            icon.hwnd = h;
+            icon.id = TRAY_ICON_ID;
+            let mut rect: Rect = zeroed();
+            if Shell_NotifyIconGetRect(&icon, &mut rect) == 0 {
+                return Point {
+                    x: if right_aligned { rect.right } else { rect.left },
+                    y: rect.top,
+                };
+            }
+        }
+        let mut point = Point { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        point
+    }
+    unsafe fn menu(h: Handle, use_icon: bool) {
+        const SM_MENUDROPALIGNMENT: i32 = 40;
+        const TPM_RIGHTALIGN: u32 = 0x08;
+        const TPM_RIGHTBUTTON: u32 = 0x02;
+        const TPM_RETURNCMD: u32 = 0x100;
+        const WM_NULL: u32 = 0;
         if let Some(app) = app() {
             let m = CreatePopupMenu();
+            if m == 0 {
+                return;
+            }
             let status = app
                 .status
                 .lock()
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| "状态不可用".into());
-            AppendMenuW(m, 3, 0, wide(connection_heading(&status)).as_ptr());
+            let panel_label = format!("打开面板 · {}", connection_heading(&status));
+            AppendMenuW(m, 0, M_TRAY_PANEL, wide(&panel_label).as_ptr());
             AppendMenuW(m, 0, M_CHECK, wide("立即检查").as_ptr());
             AppendMenuW(m, 0, M_SETTINGS, wide("设置").as_ptr());
             AppendMenuW(m, 0, M_OPEN, wide("认证页面").as_ptr());
             AppendMenuW(m, 0, M_QUIT, wide("退出").as_ptr());
-            let mut p = Point { x: 0, y: 0 };
-            GetCursorPos(&mut p);
+            let right_aligned = GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0;
+            let point = tray_menu_position(h, use_icon, right_aligned);
+            let flags =
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | if right_aligned { TPM_RIGHTALIGN } else { 0 };
             SetForegroundWindow(h);
-            TrackPopupMenu(m, 0, p.x, p.y, 0, h, null());
+            let command = TrackPopupMenu(m, flags, point.x, point.y, 0, h, null());
+            // The benign message prevents the next tray popup closing immediately.
+            PostMessageW(h, WM_NULL, 0, 0);
             DestroyMenu(m);
+            if command != 0 {
+                PostMessageW(h, WM_COMMAND, command as usize, 0);
+            } else if app.tray_available.get() {
+                Shell_NotifyIconW(NIM_SETFOCUS, &mut *app.tray.borrow_mut());
+            }
         }
     }
     unsafe fn refresh_status() {
@@ -2224,15 +2555,18 @@ mod win {
                 wide(&status).as_ptr(),
             );
             update_overview(tray.hwnd);
-            tray.flags = 4 | if notify { 0x10 } else { 0 };
-            copy_utf16(&format!("校园网守护：{status}"), &mut tray.tip);
+            tray.flags = NIF_TIP | NIF_SHOWTIP | if notify { NIF_INFO } else { 0 };
+            copy_utf16(
+                &format!("校园网守护 · {}", connection_heading(&status)),
+                &mut tray.tip,
+            );
             if notify {
                 copy_utf16("校园网守护", &mut tray.info_title);
                 copy_utf16(&status, &mut tray.info);
                 tray.info_flags = 2;
             }
-            if app.tray_available {
-                Shell_NotifyIconW(1, &mut *tray);
+            if app.tray_available.get() {
+                Shell_NotifyIconW(NIM_MODIFY, &mut *tray);
             }
         }
     }
@@ -2250,7 +2584,7 @@ mod win {
             size: size_of::<ScrollInfo>() as u32,
             mask: 0x1 | 0x2,
             min: 0,
-            max: scale_for_dpi(content_height(), UI_DPI) - 1,
+            max: scale_for_dpi(content_height(h), UI_DPI) - 1,
             page: (client.bottom - client.top).max(1) as u32,
             position: 0,
             track_position: 0,
@@ -2304,6 +2638,18 @@ mod win {
         }
         MapWindowPoints(0, h, (&mut control as *mut Rect).cast(), 2);
         let margin = scale_for_dpi(8, UI_DPI);
+        if ACTIVE_PAGE == 2 && FORM_SHIFT > 0 && GetDlgCtrlID(focus) as usize == FORM_ERROR_FIELD {
+            let mut feedback: Rect = zeroed();
+            if GetWindowRect(GetDlgItem(h, C_FORM_FEEDBACK as i32), &mut feedback) != 0 {
+                MapWindowPoints(0, h, (&mut feedback as *mut Rect).cast(), 2);
+                let top = control.top.min(feedback.top);
+                let bottom = control.bottom.max(feedback.bottom);
+                if bottom - top <= client.bottom - 2 * margin {
+                    control.top = top;
+                    control.bottom = bottom;
+                }
+            }
+        }
         if control.top < margin {
             scroll_to(h, SCROLL_OFFSET + control.top - margin);
         } else if control.bottom > client.bottom - margin {
@@ -2313,9 +2659,9 @@ mod win {
     unsafe fn dip_rect(x: i32, y: i32, w: i32, height: i32, scroll: bool) -> Rect {
         let offset = if scroll { SCROLL_OFFSET } else { 0 };
         Rect {
-            left: scale_for_dpi(x, UI_DPI),
+            left: scale_for_dpi(PANEL_WIDTH.x(x), UI_DPI),
             top: scale_for_dpi(y, UI_DPI) - offset,
-            right: scale_for_dpi(x + w, UI_DPI),
+            right: scale_for_dpi(PANEL_WIDTH.x(x + w), UI_DPI),
             bottom: scale_for_dpi(y + height, UI_DPI) - offset,
         }
     }
@@ -2376,13 +2722,13 @@ mod win {
         let rail = Rect {
             left: 0,
             top: 0,
-            right: scale_for_dpi(theme::SIDEBAR_WIDTH, UI_DPI),
+            right: scale_for_dpi(PANEL_WIDTH.sidebar, UI_DPI),
             bottom: client.bottom,
         };
         FillRect(dc, &rail, SIDEBAR_BRUSH);
         DrawIconEx(
             dc,
-            scale_for_dpi(20, UI_DPI),
+            scale_for_dpi(PANEL_WIDTH.x(20), UI_DPI),
             scale_for_dpi(28, UI_DPI),
             APP_ICON,
             scale_for_dpi(28, UI_DPI),
@@ -2408,32 +2754,44 @@ mod win {
             0,
         );
         if ACTIVE_PAGE == 1 {
+            let shift = if viewport_height(h) < COMPACT_OVERVIEW_HEIGHT {
+                COMPACT_OVERVIEW_SHIFT
+            } else {
+                0
+            };
             rounded(
                 dc,
-                &dip_rect(192, 96, 544, 144 + HERO_EXTRA, true),
+                &dip_rect(192, 96 - shift / 2, 544, 144 + HERO_EXTRA - shift / 2, true),
                 12,
                 theme::HERO,
                 theme::HERO,
             );
             rounded(
                 dc,
-                &dip_rect(192, 320 + HERO_EXTRA, 544, 96 + NETWORK_TEXT_HEIGHT, true),
+                &dip_rect(
+                    192,
+                    320 + HERO_EXTRA - shift,
+                    544,
+                    76 + NETWORK_TEXT_HEIGHT + NETWORK_DETAIL_HEIGHT,
+                    true,
+                ),
                 12,
                 theme::SURFACE,
                 theme::SURFACE_BORDER,
             );
         } else {
             for (y, height) in [(88, 96), (200, 152), (368, 152)] {
-                let shift = FORM_SHIFT + if y >= 200 { FORM_NETWORK_EXTRA } else { 0 };
+                let shift = form_feedback_shift(y)
+                    + if y >= 200 { FORM_NETWORK_EXTRA } else { 0 }
+                    + if y >= 368 { FORM_WRAP.account } else { 0 };
+                let extra = match y {
+                    88 => FORM_NETWORK_EXTRA,
+                    200 => FORM_WRAP.account,
+                    _ => FORM_WRAP.automation,
+                };
                 rounded(
                     dc,
-                    &dip_rect(
-                        192,
-                        y + shift,
-                        544,
-                        height + if y == 88 { FORM_NETWORK_EXTRA } else { 0 },
-                        true,
-                    ),
+                    &dip_rect(192, y + shift, 544, height + extra, true),
                     12,
                     theme::SURFACE,
                     theme::SURFACE_BORDER,
@@ -2445,7 +2803,7 @@ mod win {
                 (C_ADAPTER, 212, 158, 240),
                 (C_SECONDARY_ADAPTER, 476, 158, 240),
             ] {
-                let shift = FORM_SHIFT + if y >= 200 { FORM_NETWORK_EXTRA } else { 0 };
+                let shift = form_feedback_shift(y) + if y >= 200 { FORM_NETWORK_EXTRA } else { 0 };
                 let bounds = dip_rect(x, y + shift, width, 40, true);
                 let error = FORM_ERROR_FIELD == id;
                 rounded(
@@ -2748,7 +3106,7 @@ mod win {
                     3 => SCROLL_OFFSET + line * 4,
                     4 | 5 => info.track_position,
                     6 => 0,
-                    7 => scale_for_dpi(content_height(), UI_DPI),
+                    7 => scale_for_dpi(content_height(h), UI_DPI),
                     _ => SCROLL_OFFSET,
                 };
                 scroll_to(h, next);
@@ -2855,7 +3213,7 @@ mod win {
             }
             WM_CLOSE => {
                 SetWindowTextW(GetDlgItem(h, C_PASS as i32), wide("").as_ptr());
-                if app().is_some_and(|state| state.tray_available) {
+                if app().is_some_and(|state| state.tray_available.get()) {
                     ShowWindow(h, 0);
                 } else {
                     DestroyWindow(h);
@@ -2865,8 +3223,8 @@ mod win {
             WM_DESTROY => {
                 KillTimer(h, 1);
                 if let Some(app) = app() {
-                    if app.tray_available {
-                        Shell_NotifyIconW(2, &mut *app.tray.borrow_mut());
+                    if app.tray_available.get() {
+                        Shell_NotifyIconW(NIM_DELETE, &mut *app.tray.borrow_mut());
                     }
                     notify_quit(&app.generation, &app.gate, &app.tx);
                 }
@@ -2889,11 +3247,30 @@ mod win {
                 }
                 1
             }
+            message
+                if app().is_some_and(|state| {
+                    state.taskbar_created != 0 && state.taskbar_created == message
+                }) =>
+            {
+                if let Some(app) = app() {
+                    let available = register_tray(&mut *app.tray.borrow_mut());
+                    app.tray_available.set(available);
+                    SetWindowTextW(
+                        GetDlgItem(h, C_FOOTER as i32),
+                        wide(overview_footer(available)).as_ptr(),
+                    );
+                    if !available && IsWindowVisible(h) == 0 {
+                        // The panel is the remaining entry point. Do not steal focus.
+                        ShowWindow(h, 4);
+                    }
+                }
+                0
+            }
             TRAY => {
-                if l as u32 == WM_RBUTTONUP {
-                    menu(h)
-                } else if l as u32 == WM_LBUTTONDBLCLK {
-                    open_panel(h, 1);
+                match tray_action(w, l) {
+                    Some(TrayAction::Open) => open_panel(h, 1),
+                    Some(TrayAction::Menu { use_icon }) => menu(h, use_icon),
+                    None => {}
                 }
                 0
             }
@@ -2902,6 +3279,11 @@ mod win {
                 let notification = w >> 16;
                 let adapter_changed =
                     matches!(id, C_ADAPTER | C_SECONDARY_ADAPTER) && notification == 1;
+                // CBN_DROPDOWN is sent before the list appears. Refresh options
+                // after a cable or Wi-Fi change without resetting draft selections.
+                if matches!(id, C_ADAPTER | C_SECONDARY_ADAPTER) && notification == 7 {
+                    refresh_adapters(h);
+                }
                 if adapter_changed {
                     update_adapter_detail(h);
                 }
@@ -2916,6 +3298,7 @@ mod win {
                 }
                 match id {
                     C_NAV_OVERVIEW => show_page(h, 1),
+                    M_TRAY_PANEL => open_panel(h, 1),
                     C_NAV_SETTINGS => show_page(h, 2),
                     C_AUTHOR => {
                         if ShellExecuteW(
@@ -3039,31 +3422,44 @@ mod win {
                 right: 0,
                 bottom: 0,
             };
-            let work_height =
-                if SystemParametersInfoW(0x30, 0, (&mut work_area as *mut Rect).cast(), 0) != 0 {
-                    (work_area.bottom - work_area.top).max(200)
-                } else {
-                    scale_for_dpi(700, UI_DPI)
-                };
+            if SystemParametersInfoW(0x30, 0, (&mut work_area as *mut Rect).cast(), 0) == 0 {
+                work_area.right = scale_for_dpi(800, UI_DPI);
+                work_area.bottom = scale_for_dpi(700, UI_DPI);
+            }
+            #[cfg(debug_assertions)]
+            if let Some(width) = std::env::var("CAMPUS_UI_PREVIEW_WORK_WIDTH")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|width| *width > 0)
+            {
+                work_area.right = work_area.left + width;
+            }
+            let work_width = work_area.right - work_area.left;
+            let work_height = work_area.bottom - work_area.top;
             let window_style = 0x00ca0000 | 0x00200000;
+            let standard_width = scale_for_dpi(PanelWidth::STANDARD.width, UI_DPI);
             let mut frame = Rect {
                 left: 0,
                 top: 0,
-                right: scale_for_dpi(760, UI_DPI),
+                right: standard_width,
                 bottom: scale_for_dpi(CONTENT_HEIGHT, UI_DPI),
             };
             AdjustWindowRectEx(&mut frame, window_style, 0, 0);
             // AdjustWindowRectEx excludes the vertical scrollbar's width.
             frame.right += GetSystemMetrics(2);
+            let chrome_width = frame.right - frame.left - standard_width;
+            PANEL_WIDTH = PanelWidth::fit(work_width, chrome_width, UI_DPI);
+            let window_width = scale_for_dpi(PANEL_WIDTH.width, UI_DPI) + chrome_width;
+            let window_height = (frame.bottom - frame.top).min(work_height);
             let h = CreateWindowExW(
                 0,
                 class.as_ptr(),
                 wide("校园网守护").as_ptr(),
                 window_style,
-                0x80000000u32 as i32,
-                0x80000000u32 as i32,
-                frame.right - frame.left,
-                (frame.bottom - frame.top).min(work_height),
+                work_area.left + (work_width - window_width).max(0) / 2,
+                work_area.top + (work_height - window_height).max(0) / 2,
+                window_width,
+                window_height,
                 0,
                 0,
                 instance,
@@ -3232,7 +3628,7 @@ mod win {
             control(
                 h,
                 "STATIC",
-                "正常时每 60 秒检查，网络变化后重新确认。\r\n关闭窗口后继续在系统托盘运行。",
+                overview_footer(true),
                 0,
                 192,
                 468,
@@ -3299,7 +3695,12 @@ mod win {
                 );
                 let combo = GetDlgItem(h, combo_id as i32);
                 SendMessageW(combo, 0x153, usize::MAX, scale_for_dpi(23, UI_DPI) as isize);
-                SendMessageW(combo, 0x160, scale_for_dpi(360, UI_DPI) as usize, 0);
+                SendMessageW(
+                    combo,
+                    0x160,
+                    scale_for_dpi(360.min(PANEL_WIDTH.width), UI_DPI) as usize,
+                    0,
+                );
             }
             control(h, "STATIC", "", 0, 212, 208, 504, 0, C_ADAPTER_DETAIL);
             control(
@@ -3369,7 +3770,7 @@ mod win {
                 h,
                 "BUTTON",
                 "我了解并同意通过 HTTP 认证所选网络",
-                WS_TABSTOP | 3,
+                WS_TABSTOP | 3 | 0x2000,
                 212,
                 414,
                 504,
@@ -3391,7 +3792,7 @@ mod win {
                 h,
                 "BUTTON",
                 "登录 Windows 后自动启动",
-                WS_TABSTOP | 3,
+                WS_TABSTOP | 3 | 0x2000,
                 212,
                 472,
                 504,
@@ -3412,7 +3813,11 @@ mod win {
             control(
                 h,
                 "BUTTON",
-                "保存并开始守护",
+                if PANEL_WIDTH.width < 540 {
+                    "保存设置"
+                } else {
+                    "保存并开始守护"
+                },
                 WS_TABSTOP | button_style,
                 192,
                 536,
@@ -3423,7 +3828,11 @@ mod win {
             control(
                 h,
                 "BUTTON",
-                "删除保存的密码",
+                if PANEL_WIDTH.width < 540 {
+                    "删除密码"
+                } else {
+                    "删除保存的密码"
+                },
                 WS_TABSTOP | button_style,
                 560,
                 536,
@@ -3432,21 +3841,29 @@ mod win {
                 C_DELETE,
             );
             BUILD_PAGE = 0;
+            measure_form_text(h);
             let first = initial.adapter_id.is_empty()
                 || initial.username.is_empty()
                 || !initial.http_acknowledged;
             let mut tray: Notify = zeroed();
             tray.size = size_of::<Notify>() as u32;
             tray.hwnd = h;
-            tray.id = 1;
-            tray.flags = 1 | 2 | 4;
+            tray.id = TRAY_ICON_ID;
             tray.callback = TRAY;
             tray.icon = icon;
             for (to, from) in tray.tip.iter_mut().zip(wide("校园网守护")) {
                 *to = from;
             }
             // Keep a visible panel when the desktop shell cannot host a tray icon.
-            let tray_available = Shell_NotifyIconW(0, &mut tray) != 0;
+            let tray_available = register_tray(&mut tray);
+            let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
+            const MSGFLT_ALLOW: u32 = 1;
+            // Explorer runs with ordinary privileges, even when this app is elevated.
+            // These callbacks only expose the window, menu or notification icon.
+            ChangeWindowMessageFilterEx(h, TRAY, MSGFLT_ALLOW, null_mut());
+            if taskbar_created != 0 {
+                ChangeWindowMessageFilterEx(h, taskbar_created, MSGFLT_ALLOW, null_mut());
+            }
             let state = Box::new(App {
                 settings: RefCell::new(initial),
                 adapters: RefCell::new(Vec::new()),
@@ -3454,12 +3871,17 @@ mod win {
                 tx,
                 status,
                 tray: RefCell::new(tray),
-                tray_available,
+                tray_available: Cell::new(tray_available),
+                taskbar_created,
                 last_status: RefCell::new(String::new()),
                 generation,
                 gate,
             });
             APP = &*state;
+            SetWindowTextW(
+                GetDlgItem(h, C_FOOTER as i32),
+                wide(overview_footer(tray_available)).as_ptr(),
+            );
             reset_form(h);
             show_page(h, if first { 2 } else { 1 });
             SetTimer(h, 1, 1000, null());
