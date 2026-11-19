@@ -145,7 +145,7 @@ function Save-TestProcessDiagnostics {
 function Invoke-TestProcess {
     param(
         [string] $Executable, [string[]] $Arguments, [string] $Stage, [string] $LogPath,
-        [switch] $StartsApplication, [int] $ExpectedExitCode = 0
+        [switch] $StartsApplication, [switch] $OrdinaryToken, [int] $ExpectedExitCode = 0
     )
     # Inno's first phase can exit while a temporary second phase is still
     # uninstalling. -Wait tracks the process tree; the workflow step supplies
@@ -154,7 +154,7 @@ function Invoke-TestProcess {
     $failure = ''
     $startedAt = [DateTime]::UtcNow
     try {
-        if ($StartsApplication) {
+        if ($StartsApplication -or $OrdinaryToken) {
             # Wait for the installer itself, not the application it starts.
             $process = Start-OrdinaryTestProcess -Executable $Executable -Arguments $Arguments
             Assert-Condition -Condition $process.WaitForExit(60000) -Message 'The silent updater did not finish.'
@@ -229,9 +229,6 @@ namespace CampusGuardianInstallerSmoke {
         private static extern bool CreateRestrictedToken(IntPtr existingToken, uint flags,
             uint disabledCount, ref SidAndAttributes disabled, uint removedCount, IntPtr removed,
             uint restrictedCount, IntPtr restricted, out IntPtr token);
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool SetTokenInformation(IntPtr token, int infoClass,
-            IntPtr information, uint length);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool CreateProcessAsUserW(IntPtr token, string application, StringBuilder command,
             IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags,
@@ -253,17 +250,15 @@ namespace CampusGuardianInstallerSmoke {
             return name.ToString();
         }
 
-        public static Process StartWithOrdinaryToken(string executable, string[] arguments) {
+        public static Process StartWithoutAdministratorMembership(string executable, string[] arguments) {
             IntPtr original = IntPtr.Zero, restricted = IntPtr.Zero;
             var adminSid = SidBytes("S-1-5-32-544");
-            var mediumSid = SidBytes("S-1-16-8192");
-            int labelHeader = Marshal.SizeOf(typeof(SidAndAttributes));
             var disabledMemory = Marshal.AllocHGlobal(adminSid.Length);
-            var labelMemory = Marshal.AllocHGlobal(labelHeader + mediumSid.Length);
             IntPtr desktop = IntPtr.Zero;
             try {
-                // Token access: assign primary, duplicate, query, adjust defaults.
-                if (!OpenProcessToken(GetCurrentProcess(), 0x8b, out original)) {
+                // Keep the runner's integrity level for files created by its
+                // manual-install smoke, while exercising Setup without admin membership.
+                if (!OpenProcessToken(GetCurrentProcess(), 0x0b, out original)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not open runner token.");
                 }
                 Marshal.Copy(adminSid, 0, disabledMemory, adminSid.Length);
@@ -272,13 +267,6 @@ namespace CampusGuardianInstallerSmoke {
                 if (!CreateRestrictedToken(original, 1, 1, ref disabled, 0, IntPtr.Zero,
                     0, IntPtr.Zero, out restricted)) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not restrict the test token.");
-                }
-                var sid = IntPtr.Add(labelMemory, labelHeader);
-                Marshal.Copy(mediumSid, 0, sid, mediumSid.Length);
-                Marshal.StructureToPtr(new SidAndAttributes { Sid = sid, Attributes = 0x20 }, labelMemory, false);
-                // TokenIntegrityLevel, SE_GROUP_INTEGRITY. Run the fixture at normal desktop integrity.
-                if (!SetTokenInformation(restricted, 25, labelMemory, (uint)(labelHeader + mediumSid.Length))) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not set medium integrity on the test token.");
                 }
                 desktop = Marshal.StringToHGlobalUni(UserObjectName(GetProcessWindowStation()) + "\\" +
                     UserObjectName(GetThreadDesktop(GetCurrentThreadId())));
@@ -302,7 +290,6 @@ namespace CampusGuardianInstallerSmoke {
                 if (original != IntPtr.Zero) CloseHandle(original);
                 if (restricted != IntPtr.Zero) CloseHandle(restricted);
                 Marshal.FreeHGlobal(disabledMemory);
-                Marshal.FreeHGlobal(labelMemory);
                 if (desktop != IntPtr.Zero) Marshal.FreeHGlobal(desktop);
             }
         }
@@ -451,7 +438,7 @@ $runnerIsAdmin = $runnerPrincipal.IsInRole([Security.Principal.WindowsBuiltInRol
 function Start-OrdinaryTestProcess {
     param([string] $Executable, [string[]] $Arguments)
     if ($runnerIsAdmin) {
-        return [CampusGuardianInstallerSmoke.Native]::StartWithOrdinaryToken($Executable, $Arguments)
+        return [CampusGuardianInstallerSmoke.Native]::StartWithoutAdministratorMembership($Executable, $Arguments)
     }
     return Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru
 }
@@ -572,13 +559,15 @@ function Close-TestApplication {
 }
 
 function Invoke-TestInstall {
-    param([string] $Stage)
+    param([string] $Stage, [switch] $OrdinaryToken)
     Write-Host "Installer smoke test: $Stage"
     $logPath = Join-Path $smokeDirectory "$Stage.log"
-    Invoke-TestProcess -Executable $setupExecutable -Stage $Stage -LogPath $logPath -Arguments @(
+    $arguments = @(
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
         "/DIR=`"$applicationDirectory`"", "/LOG=`"$logPath`""
     )
+    if ($OrdinaryToken) { $arguments += '/TASKS=!autostart' }
+    Invoke-TestProcess -Executable $setupExecutable -Stage $Stage -LogPath $logPath -Arguments $arguments -OrdinaryToken:$OrdinaryToken
 }
 
 function Set-PreviousFixedFileVersion {
@@ -766,6 +755,14 @@ foreach ($hive in @([Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Re
 
 New-Item -ItemType Directory -Path $smokeDirectory -Force | Out-Null
 try {
+    # The disposable fixture belongs to the same user even when Setup uses a
+    # restricted token. Do not rely on the runner's Administrators group ACE.
+    $fixtureAcl = Get-Acl -LiteralPath $smokeDirectory
+    $fixtureUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $fixtureAccess = [Security.AccessControl.FileSystemAccessRule]::new(
+        $fixtureUser, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+    $fixtureAcl.AddAccessRule($fixtureAccess)
+    Set-Acl -LiteralPath $smokeDirectory -AclObject $fixtureAcl
     # load_config rejects this incomplete object. startup_controller(None) does
     # not read credentials, and worker config=None returns before portal work.
     New-Item -ItemType Directory -Path $configurationDirectory | Out-Null
@@ -793,6 +790,11 @@ try {
     Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'An upgrade re-enabled startup after the user disabled it.'
     Assert-ConfigurationPreserved
 
+    Invoke-TestUninstall -Stage 'reset-for-automatic-update'
+    Assert-UninstalledFiles
+    Invoke-TestInstall -Stage 'fresh-installed-update-fixture' -OrdinaryToken
+    Assert-InstalledFiles
+    Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'The automatic update fixture started with login startup enabled.'
     Invoke-TestAutoUpdate -Stage 'automatic-update-installed' -Executable $applicationExecutable
     Assert-InstalledFiles
     Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'The automatic update re-enabled startup.'

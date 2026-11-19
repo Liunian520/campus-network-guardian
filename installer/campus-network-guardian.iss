@@ -1,7 +1,7 @@
 ﻿; Build with tools/build-installer.ps1. This script never bundles user settings,
 ; credentials, logs, or the developer's running executable.
 #ifndef AppVersion
-  #define AppVersion "0.6.2"
+  #define AppVersion "0.6.3"
 #endif
 #ifndef RepoRoot
   #define RepoRoot ExtractFileDir(ExtractFileDir(__FILE__))
@@ -442,8 +442,21 @@ begin
   if Result then begin
     UpdateBackupPath := '';
     Log('Restored the previous guardian executable after an automatic update failure.');
-  end else
-    Log('Could not restore the previous executable; kept the automatic update backup.');
+  end else begin
+    { Replacement can fail without touching the original. Launch it again only
+      when it is byte-identical to the backup taken before the app exited. }
+    if FileExists(UpdateRestartPath) then begin
+      try
+        Result := GetSHA256OfFile(UpdateBackupPath) = GetSHA256OfFile(UpdateRestartPath);
+      except
+        Result := False;
+      end;
+    end;
+    if Result then
+      Log('The original guardian executable is intact; restart it after the update failed.')
+    else
+      Log('Could not restore the previous executable; kept the automatic update backup.');
+  end;
 end;
 
 procedure DeinitializeSetup;
