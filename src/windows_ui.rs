@@ -1276,6 +1276,7 @@ mod win {
         tx: Sender<Event>,
         status: Arc<Mutex<String>>,
         tray: RefCell<Notify>,
+        tray_available: bool,
         last_status: RefCell<String>,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
@@ -2230,7 +2231,9 @@ mod win {
                 copy_utf16(&status, &mut tray.info);
                 tray.info_flags = 2;
             }
-            Shell_NotifyIconW(1, &mut *tray);
+            if app.tray_available {
+                Shell_NotifyIconW(1, &mut *tray);
+            }
         }
     }
     // The fixed-size controls remain readable at the user's DPI; on short screens
@@ -2852,13 +2855,19 @@ mod win {
             }
             WM_CLOSE => {
                 SetWindowTextW(GetDlgItem(h, C_PASS as i32), wide("").as_ptr());
-                ShowWindow(h, 0);
+                if app().is_some_and(|state| state.tray_available) {
+                    ShowWindow(h, 0);
+                } else {
+                    DestroyWindow(h);
+                }
                 0
             }
             WM_DESTROY => {
                 KillTimer(h, 1);
                 if let Some(app) = app() {
-                    Shell_NotifyIconW(2, &mut *app.tray.borrow_mut());
+                    if app.tray_available {
+                        Shell_NotifyIconW(2, &mut *app.tray.borrow_mut());
+                    }
                     notify_quit(&app.generation, &app.gate, &app.tx);
                 }
                 PostQuitMessage(0);
@@ -3436,6 +3445,8 @@ mod win {
             for (to, from) in tray.tip.iter_mut().zip(wide("校园网守护")) {
                 *to = from;
             }
+            // Keep a visible panel when the desktop shell cannot host a tray icon.
+            let tray_available = Shell_NotifyIconW(0, &mut tray) != 0;
             let state = Box::new(App {
                 settings: RefCell::new(initial),
                 adapters: RefCell::new(Vec::new()),
@@ -3443,41 +3454,17 @@ mod win {
                 tx,
                 status,
                 tray: RefCell::new(tray),
+                tray_available,
                 last_status: RefCell::new(String::new()),
                 generation,
                 gate,
             });
             APP = &*state;
-            if Shell_NotifyIconW(0, &mut *state.tray.borrow_mut()) == 0 {
-                APP = null();
-                DestroyWindow(h);
-                if UI_FONT != 0 {
-                    DeleteObject(UI_FONT);
-                }
-                if TITLE_FONT != 0 {
-                    DeleteObject(TITLE_FONT);
-                }
-                if SECTION_FONT != 0 {
-                    DeleteObject(SECTION_FONT);
-                }
-                if BACKGROUND_BRUSH != 0 {
-                    DeleteObject(BACKGROUND_BRUSH);
-                }
-                if CARD_BRUSH != 0 {
-                    DeleteObject(CARD_BRUSH);
-                }
-                for resource in [SMALL_FONT, HERO_FONT, HERO_BRUSH, SIDEBAR_BRUSH] {
-                    if resource != 0 {
-                        DeleteObject(resource);
-                    }
-                }
-                return Err(error("创建托盘图标失败"));
-            }
             reset_form(h);
             show_page(h, if first { 2 } else { 1 });
             SetTimer(h, 1, 1000, null());
             refresh_status();
-            if first || std::env::args().any(|arg| arg == "--show") {
+            if first || !tray_available || std::env::args().any(|arg| arg == "--show") {
                 open_panel(h, if first { 2 } else { 1 });
             }
             let mut msg: Msg = zeroed();

@@ -213,6 +213,15 @@ namespace CampusGuardianInstallerSmoke {
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetProcessWindowStation();
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetThreadDesktop(uint threadId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetUserObjectInformationW(IntPtr handle, int index,
+            StringBuilder information, uint length, out uint needed);
+        [DllImport("kernel32.dll")]
         private static extern bool CloseHandle(IntPtr handle);
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
@@ -235,6 +244,15 @@ namespace CampusGuardianInstallerSmoke {
             return bytes;
         }
 
+        private static string UserObjectName(IntPtr handle) {
+            var name = new StringBuilder(256);
+            uint needed;
+            if (!GetUserObjectInformationW(handle, 2, name, (uint)name.Capacity * 2, out needed)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not identify the runner desktop.");
+            }
+            return name.ToString();
+        }
+
         public static Process StartWithOrdinaryToken(string executable, string[] arguments) {
             IntPtr original = IntPtr.Zero, restricted = IntPtr.Zero;
             var adminSid = SidBytes("S-1-5-32-544");
@@ -242,6 +260,7 @@ namespace CampusGuardianInstallerSmoke {
             int labelHeader = Marshal.SizeOf(typeof(SidAndAttributes));
             var disabledMemory = Marshal.AllocHGlobal(adminSid.Length);
             var labelMemory = Marshal.AllocHGlobal(labelHeader + mediumSid.Length);
+            IntPtr desktop = IntPtr.Zero;
             try {
                 // Token access: assign primary, duplicate, query, adjust defaults.
                 if (!OpenProcessToken(GetCurrentProcess(), 0x8b, out original)) {
@@ -261,7 +280,9 @@ namespace CampusGuardianInstallerSmoke {
                 if (!SetTokenInformation(restricted, 25, labelMemory, (uint)(labelHeader + mediumSid.Length))) {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not set medium integrity on the test token.");
                 }
-                var startup = new StartupInfo { Size = (uint)Marshal.SizeOf(typeof(StartupInfo)), Flags = 1 };
+                desktop = Marshal.StringToHGlobalUni(UserObjectName(GetProcessWindowStation()) + "\\" +
+                    UserObjectName(GetThreadDesktop(GetCurrentThreadId())));
+                var startup = new StartupInfo { Size = (uint)Marshal.SizeOf(typeof(StartupInfo)), Flags = 1, Desktop = desktop };
                 var command = new StringBuilder("\"" + executable + "\" " + String.Join(" ", arguments));
                 ProcessInfo child;
                 if (!CreateProcessAsUserW(restricted, executable, command, IntPtr.Zero, IntPtr.Zero,
@@ -282,6 +303,7 @@ namespace CampusGuardianInstallerSmoke {
                 if (restricted != IntPtr.Zero) CloseHandle(restricted);
                 Marshal.FreeHGlobal(disabledMemory);
                 Marshal.FreeHGlobal(labelMemory);
+                if (desktop != IntPtr.Zero) Marshal.FreeHGlobal(desktop);
             }
         }
 
@@ -596,6 +618,9 @@ function Invoke-TestAutoUpdate {
     $script:testApplicationProcess = Start-OrdinaryTestProcess -Executable $Executable -Arguments @('--show', '--from-update')
     $oldProcessId = $script:testApplicationProcess.Id
     Wait-TestCondition -Condition {
+        if ($script:testApplicationProcess.HasExited) {
+            throw "The older guardian exited with code $($script:testApplicationProcess.ExitCode) before exposing a window."
+        }
         [CampusGuardianInstallerSmoke.Native]::WindowForProcess([uint32] $oldProcessId) -ne [IntPtr]::Zero
     } -Failure 'The older guardian did not open its window.'
     $directory = Split-Path -LiteralPath $Executable
