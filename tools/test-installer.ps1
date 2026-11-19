@@ -143,7 +143,10 @@ function Save-TestProcessDiagnostics {
 }
 
 function Invoke-TestProcess {
-    param([string] $Executable, [string[]] $Arguments, [string] $Stage, [string] $LogPath)
+    param(
+        [string] $Executable, [string[]] $Arguments, [string] $Stage, [string] $LogPath,
+        [switch] $StartsApplication, [int] $ExpectedExitCode = 0
+    )
     # Inno's first phase can exit while a temporary second phase is still
     # uninstalling. -Wait tracks the process tree; the workflow step supplies
     # the overall five-minute timeout.
@@ -151,15 +154,21 @@ function Invoke-TestProcess {
     $failure = ''
     $startedAt = [DateTime]::UtcNow
     try {
-        $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru -Wait
-        if ($process.ExitCode -ne 0) {
-            throw "Installer or uninstaller stage '$Stage' returned exit code $($process.ExitCode)."
+        if ($StartsApplication) {
+            # Wait for the installer itself, not the application it starts.
+            $process = Start-OrdinaryTestProcess -Executable $Executable -Arguments $Arguments
+            Assert-Condition -Condition $process.WaitForExit(60000) -Message 'The silent updater did not finish.'
+        } else {
+            $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru -Wait
+        }
+        if ($process.ExitCode -ne $ExpectedExitCode) {
+            throw "Installer or uninstaller stage '$Stage' returned exit code $($process.ExitCode) instead of $ExpectedExitCode."
         }
     } catch {
         $failure = $_.Exception.Message
         throw
     } finally {
-        $exitCode = if ($null -ne $process) { $process.ExitCode } else { $null }
+        $exitCode = if ($null -ne $process -and $process.HasExited) { $process.ExitCode } else { $null }
         try {
             Save-TestProcessDiagnostics -Stage $Stage -Executable $Executable -Arguments $Arguments -LogPath $LogPath -ExitCode $exitCode -Failure $failure -StartedAt $startedAt
         } catch {
@@ -168,18 +177,114 @@ function Invoke-TestProcess {
         if ($null -ne $process) { $process.Dispose() }
     }
     Start-Sleep -Milliseconds 250
-    Assert-NoApplicationProcess
+    if (-not $StartsApplication) { Assert-NoApplicationProcess }
 }
 
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace CampusGuardianInstallerSmoke {
     public static class Native {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SidAndAttributes {
+            public IntPtr Sid;
+            public uint Attributes;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfo {
+            public uint Size;
+            public IntPtr Reserved, Desktop, Title;
+            public uint X, Y, Width, Height, XChars, YChars, Fill, Flags;
+            public ushort ShowWindow, ReservedSize;
+            public IntPtr ReservedData, StdIn, StdOut, StdErr;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInfo {
+            public IntPtr Process, Thread;
+            public int ProcessId, ThreadId;
+        }
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool CreateRestrictedToken(IntPtr existingToken, uint flags,
+            uint disabledCount, ref SidAndAttributes disabled, uint removedCount, IntPtr removed,
+            uint restrictedCount, IntPtr restricted, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool SetTokenInformation(IntPtr token, int infoClass,
+            IntPtr information, uint length);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcessAsUserW(IntPtr token, string application, StringBuilder command,
+            IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags,
+            IntPtr environment, string directory, ref StartupInfo startup, out ProcessInfo process);
+
+        private static byte[] SidBytes(string identifier) {
+            var sid = new SecurityIdentifier(identifier);
+            var bytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(bytes, 0);
+            return bytes;
+        }
+
+        public static Process StartWithOrdinaryToken(string executable, string[] arguments) {
+            IntPtr original = IntPtr.Zero, restricted = IntPtr.Zero;
+            var adminSid = SidBytes("S-1-5-32-544");
+            var mediumSid = SidBytes("S-1-16-8192");
+            int labelHeader = Marshal.SizeOf(typeof(SidAndAttributes));
+            var disabledMemory = Marshal.AllocHGlobal(adminSid.Length);
+            var labelMemory = Marshal.AllocHGlobal(labelHeader + mediumSid.Length);
+            try {
+                // Token access: assign primary, duplicate, query, adjust defaults.
+                if (!OpenProcessToken(GetCurrentProcess(), 0x8b, out original)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not open runner token.");
+                }
+                Marshal.Copy(adminSid, 0, disabledMemory, adminSid.Length);
+                var disabled = new SidAndAttributes { Sid = disabledMemory };
+                // DISABLE_MAX_PRIVILEGE and a deny-only Administrators SID.
+                if (!CreateRestrictedToken(original, 1, 1, ref disabled, 0, IntPtr.Zero,
+                    0, IntPtr.Zero, out restricted)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not restrict the test token.");
+                }
+                var sid = IntPtr.Add(labelMemory, labelHeader);
+                Marshal.Copy(mediumSid, 0, sid, mediumSid.Length);
+                Marshal.StructureToPtr(new SidAndAttributes { Sid = sid, Attributes = 0x20 }, labelMemory, false);
+                // TokenIntegrityLevel, SE_GROUP_INTEGRITY. Run the fixture at normal desktop integrity.
+                if (!SetTokenInformation(restricted, 25, labelMemory, (uint)(labelHeader + mediumSid.Length))) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not set medium integrity on the test token.");
+                }
+                var startup = new StartupInfo { Size = (uint)Marshal.SizeOf(typeof(StartupInfo)), Flags = 1 };
+                var command = new StringBuilder("\"" + executable + "\" " + String.Join(" ", arguments));
+                ProcessInfo child;
+                if (!CreateProcessAsUserW(restricted, executable, command, IntPtr.Zero, IntPtr.Zero,
+                    false, 0, IntPtr.Zero, Path.GetDirectoryName(executable), ref startup, out child)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not launch the ordinary-user test fixture.");
+                }
+                try {
+                    var process = Process.GetProcessById(child.ProcessId);
+                    // Cache an open handle for exit reporting if Setup exits quickly.
+                    GC.KeepAlive(process.SafeHandle);
+                    return process;
+                } finally {
+                    CloseHandle(child.Thread);
+                    CloseHandle(child.Process);
+                }
+            } finally {
+                if (original != IntPtr.Zero) CloseHandle(original);
+                if (restricted != IntPtr.Zero) CloseHandle(restricted);
+                Marshal.FreeHGlobal(disabledMemory);
+                Marshal.FreeHGlobal(labelMemory);
+            }
+        }
+
         [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IShellLinkW {
             // Preserve the native vtable order through GetArguments. The setter
@@ -318,6 +423,17 @@ namespace CampusGuardianInstallerSmoke {
 }
 '@
 
+$runnerPrincipal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+$runnerIsAdmin = $runnerPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+function Start-OrdinaryTestProcess {
+    param([string] $Executable, [string[]] $Arguments)
+    if ($runnerIsAdmin) {
+        return [CampusGuardianInstallerSmoke.Native]::StartWithOrdinaryToken($Executable, $Arguments)
+    }
+    return Start-Process -FilePath $Executable -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+}
+
 function Assert-FileIdentityVerification {
     # Exercise only dummy data inside the guarded hosted-runner test directory.
     # This must pass before using file identities to validate an installed .lnk.
@@ -383,7 +499,7 @@ function Start-TestApplicationAndCheckUi {
     Assert-EmptyConfiguration
     Assert-NoApplicationProcess
     Write-Host 'Installer smoke test: launch only the unconfigured application; no account, password, consent, save, or check action is supplied.'
-    $script:testApplicationProcess = Start-Process -FilePath $applicationExecutable -ArgumentList '--show' -WindowStyle Hidden -PassThru
+    $script:testApplicationProcess = Start-Process -FilePath $applicationExecutable -ArgumentList '--show', '--from-update' -WindowStyle Hidden -PassThru
     Wait-TestCondition -Condition {
         if ($script:testApplicationProcess.HasExited) {
             throw 'The unconfigured application exited before creating its window. A hosted Windows desktop/tray surface is required.'
@@ -441,6 +557,85 @@ function Invoke-TestInstall {
         '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
         "/DIR=`"$applicationDirectory`"", "/LOG=`"$logPath`""
     )
+}
+
+function Set-PreviousFixedFileVersion {
+    param([string] $Executable)
+    Assert-ChildPath -Path $Executable -Parent $smokeDirectory
+    $bytes = [System.IO.File]::ReadAllBytes($Executable)
+    $version = [version] $ExpectedVersion
+    $high = [uint32] ($version.Major * 65536 + $version.Minor)
+    $low = [uint32] ($version.Build * 65536)
+    $matches = @(
+        for ($i = [Array]::IndexOf($bytes, [byte] 0xbd); $i -ge 0 -and $i -le $bytes.Length - 24;
+             $i = [Array]::IndexOf($bytes, [byte] 0xbd, $i + 1)) {
+            if ([BitConverter]::ToUInt32($bytes, $i) -eq 0xfeef04bdL -and
+                [BitConverter]::ToUInt32($bytes, $i + 4) -eq 0x00010000 -and
+                [BitConverter]::ToUInt32($bytes, $i + 8) -eq $high -and
+                [BitConverter]::ToUInt32($bytes, $i + 12) -eq $low) { $i }
+        }
+    )
+    Assert-Condition -Condition ($matches.Count -eq 1) -Message 'Expected one matching VS_FIXEDFILEINFO in the test executable.'
+    # Alter only the fixed PE version in the disposable copy. Setup uses it
+    # to exercise replacement of an older running release.
+    [Array]::Clear($bytes, $matches[0] + 8, 16)
+    $bytes[$matches[0] + 12] = 1
+    $bytes[$matches[0] + 20] = 1
+    [System.IO.File]::WriteAllBytes($Executable, $bytes)
+    Assert-Condition -Condition ((Get-Item -LiteralPath $Executable).VersionInfo.FileMajorPart -eq 0 -and
+        (Get-Item -LiteralPath $Executable).VersionInfo.FileMinorPart -eq 0 -and
+        (Get-Item -LiteralPath $Executable).VersionInfo.FileBuildPart -eq 0 -and
+        (Get-Item -LiteralPath $Executable).VersionInfo.FilePrivatePart -eq 1) -Message 'The test executable did not report the older fixed version.'
+}
+
+function Invoke-TestAutoUpdate {
+    param([string] $Stage, [string] $Executable, [switch] $Portable)
+    Assert-EmptyConfiguration
+    Assert-NoApplicationProcess
+    Set-PreviousFixedFileVersion -Executable $Executable
+    $script:testApplicationProcess = Start-OrdinaryTestProcess -Executable $Executable -Arguments @('--show', '--from-update')
+    $oldProcessId = $script:testApplicationProcess.Id
+    Wait-TestCondition -Condition {
+        [CampusGuardianInstallerSmoke.Native]::WindowForProcess([uint32] $oldProcessId) -ne [IntPtr]::Zero
+    } -Failure 'The older guardian did not open its window.'
+    $directory = Split-Path -LiteralPath $Executable
+    $logPath = Join-Path $smokeDirectory "$Stage.log"
+    $arguments = @(
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOCANCEL',
+        '/NOCLOSEAPPLICATIONS', '/NORESTARTAPPLICATIONS', '/GUARDIANUPDATE',
+        "/DIR=`"$directory`"", "/LOG=`"$logPath`""
+    )
+    try {
+        if ($Portable) {
+            $wrongMode = 'automatic-update-rejects-unregistered-target'
+            $wrongLogPath = Join-Path $smokeDirectory "$wrongMode.log"
+            $wrongArguments = $arguments[0..($arguments.Count - 2)] + "/LOG=`"$wrongLogPath`""
+            Invoke-TestProcess -Executable $setupExecutable -Stage $wrongMode -LogPath $wrongLogPath -Arguments $wrongArguments -StartsApplication -ExpectedExitCode 7
+            Assert-Condition -Condition (-not $script:testApplicationProcess.HasExited) -Message 'A rejected update exited the portable application.'
+            $arguments += '/GUARDIANPORTABLE'
+        }
+        Invoke-TestProcess -Executable $setupExecutable -Stage $Stage -LogPath $logPath -Arguments $arguments -StartsApplication
+        Assert-Condition -Condition $script:testApplicationProcess.WaitForExit(10000) -Message 'The updater did not exit the older guardian.'
+        Assert-Condition -Condition ($script:testApplicationProcess.ExitCode -eq 0) -Message 'The older guardian did not exit cleanly.'
+        Wait-TestCondition -Condition {
+            $restarted = Get-Process -Name 'campus-network-guardian' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Id -ne $oldProcessId -and $_.Path -ieq $Executable }
+            $null -ne $restarted
+        } -Failure 'The updater did not restart the guardian from the same path.'
+        Assert-Condition -Condition (Test-WindowsBinaryVersion -VersionInfo (Get-Item -LiteralPath $Executable).VersionInfo -ExpectedVersion $ExpectedVersion) -Message 'The restarted guardian path does not contain the new version.'
+        Assert-ConfigurationPreserved
+    } finally {
+        Close-TestApplication
+        $script:testApplicationProcess = Get-Process -Name 'campus-network-guardian' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -ne $oldProcessId -and $_.Path -ieq $Executable } |
+            Select-Object -First 1
+        if ($null -ne $script:testApplicationProcess) {
+            Wait-TestCondition -Condition {
+                [CampusGuardianInstallerSmoke.Native]::WindowForProcess([uint32] $script:testApplicationProcess.Id) -ne [IntPtr]::Zero
+            } -Failure 'The restarted guardian did not create its window.'
+            Close-TestApplication
+        }
+    }
 }
 
 function Invoke-TestUninstall {
@@ -573,6 +768,23 @@ try {
     Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'An upgrade re-enabled startup after the user disabled it.'
     Assert-ConfigurationPreserved
 
+    Invoke-TestAutoUpdate -Stage 'automatic-update-installed' -Executable $applicationExecutable
+    Assert-InstalledFiles
+    Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'The automatic update re-enabled startup.'
+
+    $portableDirectory = Join-Path $smokeDirectory 'Portable App With Spaces'
+    New-Item -ItemType Directory -Path $portableDirectory | Out-Null
+    $portableExecutable = Join-Path $portableDirectory 'campus-network-guardian.exe'
+    Copy-Item -LiteralPath $applicationExecutable -Destination $portableExecutable
+    $portableMarker = Join-Path $portableDirectory 'keep.txt'
+    Set-Content -LiteralPath $portableMarker -Value 'portable fixture' -NoNewline
+    Invoke-TestAutoUpdate -Stage 'automatic-update-portable' -Executable $portableExecutable -Portable
+    $portableFiles = @(Get-ChildItem -LiteralPath $portableDirectory -Force)
+    Assert-Condition -Condition ($portableFiles.Count -eq 2 -and
+        (Get-Content -LiteralPath $portableMarker -Raw) -ceq 'portable fixture') -Message 'The portable update modified files outside the executable.'
+    Assert-InstalledFiles
+    Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'The portable update changed startup registration.'
+
     Write-RunCommand -Command $ownRunCommand
     Invoke-TestUninstall -Stage 'uninstall-owned-startup'
     Assert-Condition -Condition ($null -eq (Read-RunCommand)) -Message 'Uninstall left the Run value belonging to this installation.'
@@ -588,7 +800,7 @@ try {
     Assert-UninstalledFiles
     Assert-ConfigurationPreserved
     $smokeSucceeded = $true
-    Write-Host 'Installer smoke test passed: silent install, version, shortcuts, actual Run checkbox, single-instance --show restoration, running-app upgrade, disabled-startup retention, owned/foreign Run cleanup, and user data retention.'
+    Write-Host 'Installer smoke test passed: silent install, version, shortcuts, actual Run checkbox, single-instance --show restoration, running-app upgrade, installed and portable automatic restart, disabled-startup retention, owned/foreign Run cleanup, and user data retention.'
     Write-Host 'The application was launched only without valid configuration or HTTP consent; no authentication input, save, check, portal action, or Credential Manager operation was performed.'
 } finally {
     # Clean up only paths/values created by this test on this hosted runner.

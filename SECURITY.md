@@ -21,3 +21,5 @@ v0.5.1 登录前会向 `http://www.msftconnecttest.com/connecttest.txt` 发送�
 Wi-Fi profile XML 可能含密钥材料，不能作为普通诊断日志或问题附件上传。实现不应请求明文 Wi-Fi 密钥，也不应在日志中记录完整 profile XML 或附加用户数据。
 
 密码保存在当前用户的 Windows 凭据管理器中；配置和日志不应含密码、Cookie 或令牌。程序不承诺保护已被恶意软件控制的 Windows 用户会话。安装包和便携包的 SHA-256 文件用于检查下载内容是否一致，不代表代码签名或独立安全审计。
+
+自动更新只接受固定 GitHub 仓库中较新的稳定发布。镜像用于发现版本和下载，安装前通过独立的 GitHub HTTPS 发布接口确认安装包名称、长度和 SHA-256，并重新校验即将执行的暂存文件。版本检查不读取校园网凭据。静默安装及其后的重启使用普通用户权限。 [GitHub 发布接口](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)

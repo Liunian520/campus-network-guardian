@@ -1,7 +1,7 @@
 ﻿; Build with tools/build-installer.ps1. This script never bundles user settings,
 ; credentials, logs, or the developer's running executable.
 #ifndef AppVersion
-  #define AppVersion "0.5.1"
+  #define AppVersion "0.6.0"
 #endif
 #ifndef RepoRoot
   #define RepoRoot ExtractFileDir(ExtractFileDir(__FILE__))
@@ -41,6 +41,9 @@ DisableWelcomePage=yes
 DisableReadyPage=yes
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
+SetupMutex=Local\CampusNetworkGuardian.Setup
+Uninstallable=not IsPortableUpdate
+CreateUninstallRegKey=not IsPortableUpdate
 WizardStyle=modern
 SetupIconFile={#RepoRoot}\assets\guardian.ico
 UninstallDisplayIcon={app}\{#AppExeName}
@@ -63,20 +66,20 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
-Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
-Source: "{#RepoRoot}\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#RepoRoot}\installer\languages\INNO-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
-Source: "{#RepoRoot}\installer\languages\THIRD-PARTY.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion; Check: IsRegisteredMode
+Source: "{#RepoRoot}\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion; Check: IsRegisteredMode
+Source: "{#RepoRoot}\installer\languages\INNO-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion; Check: IsRegisteredMode
+Source: "{#RepoRoot}\installer\languages\THIRD-PARTY.md"; DestDir: "{app}\licenses"; Flags: ignoreversion; Check: IsRegisteredMode
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--show"; WorkingDir: "{app}"
-Name: "{group}\卸载{#AppName}"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--show"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--show"; WorkingDir: "{app}"; Check: IsRegisteredMode
+Name: "{group}\卸载{#AppName}"; Filename: "{uninstallexe}"; Check: IsRegisteredMode
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "--show"; WorkingDir: "{app}"; Tasks: desktopicon; Check: IsRegisteredMode
 
 [Registry]
 ; Deliberately omit uninsdeletevalue: uninstall must not delete a Run entry
 ; subsequently changed to another copy of the application.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "CampusNetworkGuardian"; ValueData: """{app}\{#AppExeName}"""; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "CampusNetworkGuardian"; ValueData: """{app}\{#AppExeName}"""; Tasks: autostart; Check: IsRegisteredMode
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Parameters: "--show"; Description: "启动校园网守护"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
@@ -86,15 +89,24 @@ const
   GuardianWindowClass = 'CampusNetworkGuardianWindow';
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   RunValueName = 'CampusNetworkGuardian';
+  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\CampusNetworkGuardian.Windows_is1';
+  UpdateReadyPrefix = 'CampusNetworkGuardian.UpdateReady.';
   GuardianQuitCommand = 204;
   GuardianCommandMessage = $0111;
   ProcessQueryLimitedInformation = $1000;
   ProcessSynchronize = $100000;
   WaitObject0 = 0;
   WaitTimeout = 258;
+  EventModifyState = 2;
+  MoveFileReplaceExisting = 1;
+  MoveFileWriteThrough = 8;
 
 var
   PendingAutostartSelection, DesiredAutostartSelection: Boolean;
+  UpdateBackupPath, UpdateRestartPath: String;
+  UpdateOwnerProcess: Cardinal;
+  UpdateReadyEvent: String;
+  UpdateCompleted: Boolean;
 
 function FindGuardianWindow(Parent, After: HWND; ClassName: String;
   WindowName: Cardinal): HWND;
@@ -111,10 +123,40 @@ function WaitGuardianProcess(Process: Cardinal; Milliseconds: Cardinal): Cardina
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseGuardianHandle(Handle: Cardinal): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
+function MoveGuardianFile(const Source, Destination: String; Flags: Cardinal): Boolean;
+  external 'MoveFileExW@kernel32.dll stdcall';
+function GuardianIsAdmin: Boolean;
+  external 'IsUserAnAdmin@shell32.dll stdcall';
+function OpenGuardianEvent(Access: Cardinal; Inherit: Boolean; const Name: String): Cardinal;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SignalGuardianEvent(Handle: Cardinal): Boolean;
+  external 'SetEvent@kernel32.dll stdcall';
 
-function InstalledExecutable: String;
+function HasSwitch(const SwitchName: String): Boolean;
+var
+  Index: Integer;
 begin
-  Result := ExpandFileName(ExpandConstant('{app}\{#AppExeName}'));
+  Result := False;
+  for Index := 1 to ParamCount do
+    if CompareText(ParamStr(Index), SwitchName) = 0 then begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function IsAutomaticUpdate: Boolean;
+begin
+  Result := HasSwitch('/GUARDIANUPDATE');
+end;
+
+function IsPortableUpdate: Boolean;
+begin
+  Result := IsAutomaticUpdate and HasSwitch('/GUARDIANPORTABLE');
+end;
+
+function IsRegisteredMode: Boolean;
+begin
+  Result := not IsPortableUpdate;
 end;
 
 function CanonicalExecutable(const Path: String): String;
@@ -123,6 +165,83 @@ begin
   if Copy(Result, 1, 4) = '\\?\' then
     Delete(Result, 1, 4);
   Result := ExpandFileName(Result);
+end;
+
+function InstalledExecutable: String;
+begin
+  Result := CanonicalExecutable(ExpandConstant('{app}\{#AppExeName}'));
+end;
+
+function ValidateUpdateHandoff: Boolean;
+var
+  OwnerText, Suffix: String;
+  Owner, Index: Integer;
+begin
+  OwnerText := ExpandConstant('{param:GUARDIANOWNER|}');
+  UpdateReadyEvent := ExpandConstant('{param:GUARDIANREADY|}');
+  Result := (OwnerText = '') and (UpdateReadyEvent = '');
+  if Result then
+    Exit;
+  Owner := StrToIntDef(OwnerText, 0);
+  if (Owner <= 0) or (Length(UpdateReadyEvent) <> Length(UpdateReadyPrefix) + 32) or
+    (Copy(UpdateReadyEvent, 1, Length(UpdateReadyPrefix)) <> UpdateReadyPrefix) then
+    Exit;
+  Suffix := UpperCase(Copy(UpdateReadyEvent, Length(UpdateReadyPrefix) + 1, 32));
+  for Index := 1 to Length(Suffix) do
+    if Pos(Copy(Suffix, Index, 1), '0123456789ABCDEF') = 0 then
+      Exit;
+  UpdateOwnerProcess := Owner;
+  Result := True;
+end;
+
+function ValidateUpdateTarget: String;
+var
+  Directory, RegisteredDirectory, Target: String;
+  IsRegistered: Boolean;
+  CurrentVersion, SetupVersion: Int64;
+begin
+  Result := '';
+  if GuardianIsAdmin then begin
+    Result := '自动更新必须在普通用户权限下执行。';
+    Exit;
+  end;
+  if not ValidateUpdateHandoff then begin
+    Result := '自动更新的进程交接参数无效。';
+    Exit;
+  end;
+  Directory := ExpandConstant('{param:DIR|}');
+  Target := InstalledExecutable;
+  if not WizardSilent or (Directory = '') or
+    (CompareText(CanonicalExecutable(AddBackslash(Directory) + '{#AppExeName}'), Target) <> 0) then begin
+    Result := '自动更新必须使用已验证的当前程序目录。';
+    Exit;
+  end;
+  IsRegistered := RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', RegisteredDirectory) and
+    (RegisteredDirectory <> '') and
+    (CompareText(CanonicalExecutable(AddBackslash(RegisteredDirectory) + '{#AppExeName}'), Target) = 0);
+  if IsRegistered = IsPortableUpdate then begin
+    Result := '更新模式与当前程序的安装记录不一致。';
+    Exit;
+  end;
+  if not GetPackedVersion(Target, CurrentVersion) or
+    not GetPackedVersion(ExpandConstant('{srcexe}'), SetupVersion) or
+    (ComparePackedVersion(CurrentVersion, SetupVersion) >= 0) then
+    Result := '无法确认当前版本低于更新版本。';
+end;
+
+function NotifyUpdateOwner: Boolean;
+var
+  Signal: Cardinal;
+begin
+  Result := False;
+  Signal := OpenGuardianEvent(EventModifyState, False, 'Local\' + UpdateReadyEvent);
+  if Signal = 0 then
+    Exit;
+  try
+    Result := SignalGuardianEvent(Signal);
+  finally
+    CloseGuardianHandle(Signal);
+  end;
 end;
 
 function MatchesRunExecutable(const Command, Expected: String): Boolean;
@@ -167,7 +286,9 @@ begin
     the default, previous, or command-line directory selected by the wizard. }
   Expected := ExpandFileName(AddBackslash(WizardDirValue) + '{#AppExeName}');
   PendingAutostartSelection := False;
-  if FileExists(Expected) and not TasksWereExplicitlySelected then begin
+  if IsPortableUpdate then
+    Log('Portable update: preserve installation and startup registration.')
+  else if FileExists(Expected) and not TasksWereExplicitlySelected then begin
     DesiredAutostartSelection :=
       RegQueryStringValue(HKCU, RunKey, RunValueName, Command) and
       MatchesRunExecutable(Command, Expected);
@@ -226,7 +347,7 @@ begin
     NextWindow := FindGuardianWindow(0, Window, GuardianWindowClass, 0);
     ProcessId := 0;
     GuardianWindowProcess(Window, ProcessId);
-    if ProcessId <> 0 then begin
+    if (ProcessId <> 0) and ((UpdateOwnerProcess = 0) or (ProcessId = UpdateOwnerProcess)) then begin
       Process := OpenGuardianProcess(
         ProcessQueryLimitedInformation or ProcessSynchronize, False, ProcessId);
       if Process = 0 then begin
@@ -243,6 +364,15 @@ begin
         SetLength(Buffer, Characters);
         ActualPath := CanonicalExecutable(Buffer);
         if CompareText(ActualPath, InstalledExecutable) = 0 then begin
+          if IsAutomaticUpdate then begin
+            { Keep a same-volume backup before asking the application to exit. }
+            UpdateBackupPath := GenerateUniqueName(ExtractFileDir(ActualPath), '.guardian-backup');
+            if not FileCopy(ActualPath, UpdateBackupPath, True) then begin
+              UpdateBackupPath := '';
+              Result := '无法备份现有程序，自动更新已取消。';
+              Exit;
+            end;
+          end;
           { Recheck the window's owner immediately before posting the command. }
           VerifiedProcessId := 0;
           GuardianWindowProcess(Window, VerifiedProcessId);
@@ -250,9 +380,14 @@ begin
             Result := '校园网守护进程发生变化。请从托盘退出该程序后重试。';
             Exit;
           end;
-          { WM_CLOSE only hides this app. Use its existing graceful Quit command.
-            This invalidates pending operations without logging out the network. }
-          if not PostMessage(Window, GuardianCommandMessage, GuardianQuitCommand, 0) then begin
+          { The elevated owner closes its own window after our independent
+            verification and backup. An ordinary updater can request Quit. }
+          if UpdateOwnerProcess <> 0 then begin
+            if not NotifyUpdateOwner then begin
+              Result := '无法通知校园网守护接续自动更新，已取消更新。';
+              Exit;
+            end;
+          end else if not PostMessage(Window, GuardianCommandMessage, GuardianQuitCommand, 0) then begin
             Result := '无法正常退出已安装的校园网守护。请从托盘退出后重试。';
             Exit;
           end;
@@ -264,6 +399,11 @@ begin
           end;
           if WaitResult <> WaitObject0 then begin
             Result := '校园网守护尚未退出。请等待网络操作结束，或从托盘退出后重试。';
+            Exit;
+          end;
+          if IsAutomaticUpdate then begin
+            UpdateRestartPath := ActualPath;
+            Log('The matching guardian exited gracefully for automatic update.');
             Exit;
           end;
           Log('The matching installed guardian exited gracefully.');
@@ -278,13 +418,56 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  if IsAutomaticUpdate then begin
+    Result := ValidateUpdateTarget;
+    if (Result <> '') or (UpdateRestartPath <> '') then
+      Exit;
+  end;
   Result := CloseInstalledGuardian;
+  if IsAutomaticUpdate and (Result = '') and (UpdateRestartPath = '') then
+    Result := '自动更新要求运行中的校园网守护与目标路径一致。';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if (CurStep = ssPostInstall) and not WizardIsTaskSelected('autostart') then
+  if (CurStep = ssPostInstall) and IsRegisteredMode and not WizardIsTaskSelected('autostart') then
     RemoveOwnedAutostart;
+  if CurStep = ssDone then
+    UpdateCompleted := True;
+end;
+
+function RestoreUpdateBackup: Boolean;
+begin
+  Result := MoveGuardianFile(UpdateBackupPath, UpdateRestartPath, MoveFileReplaceExisting or MoveFileWriteThrough);
+  if Result then begin
+    UpdateBackupPath := '';
+    Log('Restored the previous guardian executable after an automatic update failure.');
+  end else
+    Log('Could not restore the previous executable; kept the automatic update backup.');
+end;
+
+procedure DeinitializeSetup;
+var
+  ResultCode: Integer;
+begin
+  if UpdateBackupPath = '' then
+    Exit;
+  if UpdateRestartPath <> '' then begin
+    if not UpdateCompleted and not RestoreUpdateBackup then
+      Exit;
+    { Automatic Setup and its restored application run as the ordinary user. }
+    if not Exec(UpdateRestartPath, '--from-update', ExtractFileDir(UpdateRestartPath), SW_SHOWNORMAL, ewNoWait, ResultCode) then begin
+      Log('Could not restart the updated guardian: ' + SysErrorMessage(ResultCode));
+      if UpdateBackupPath <> '' then begin
+        if not RestoreUpdateBackup then
+          Exit;
+        if not Exec(UpdateRestartPath, '--from-update', ExtractFileDir(UpdateRestartPath), SW_SHOWNORMAL, ewNoWait, ResultCode) then
+          Log('Could not restart the restored guardian: ' + SysErrorMessage(ResultCode));
+      end;
+    end;
+  end;
+  if UpdateBackupPath <> '' then
+    DeleteFile(UpdateBackupPath);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

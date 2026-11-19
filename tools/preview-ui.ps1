@@ -96,6 +96,7 @@ fn main() {
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
+            secondary_adapter_id: String::new(),
             username: "demo-campus".into(),
             http_acknowledged: true,
             autostart: false,
@@ -222,7 +223,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         [GuardianPreviewNative]::PostMessage($Window, 0x28, $nav, [IntPtr]1) | Out-Null
         Start-Sleep -Milliseconds 100
         $ids = [Collections.Generic.List[int]]::new()
-        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,110,201,203) } else { @(301,302,303,304,101,102,103,104,105,106,107) }
+        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,110,201,203) } else { @(301,302,303,304,101,135,102,103,104,105,106,107) }
         for ($tab = 0; $tab -lt 20; $tab++) {
             $focus = [GuardianPreviewNative]::PreviewFocus($Window)
             if ($focus -eq [IntPtr]::Zero) { throw 'Preview does not expose background keyboard focus; no foreground activation was attempted.' }
@@ -244,10 +245,12 @@ function Test-PreviewNavigation([IntPtr]$Window) {
     $settingsNav = [GuardianPreviewNative]::GetDlgItem($Window, 302)
     $overviewNav = [GuardianPreviewNative]::GetDlgItem($Window, 301)
     [GuardianPreviewNative]::SendMessage($settingsNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $secondary = [GuardianPreviewNative]::GetDlgItem($Window, 135)
     $username = [GuardianPreviewNative]::GetDlgItem($Window, 102)
     $password = [GuardianPreviewNative]::GetDlgItem($Window, 103)
     [GuardianPreviewNative]::SetControlText($username, 'demo-edited') | Out-Null
     [GuardianPreviewNative]::SetControlText($password, 'fake-preview-draft-only') | Out-Null
+    [GuardianPreviewNative]::SendMessage($secondary, 0x14e, [IntPtr]2, [IntPtr]::Zero) | Out-Null
     [GuardianPreviewNative]::SendMessage($overviewNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     [GuardianPreviewNative]::SendMessage($settingsNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     if ([GuardianPreviewNative]::ReadControlText($username) -ne 'demo-edited') { throw 'Navigating between pages discarded the fake username edit.' }
@@ -255,9 +258,11 @@ function Test-PreviewNavigation([IntPtr]$Window) {
     # WM_GETTEXTLENGTH verifies the nonempty fake draft without reading it.
     $draftLength = [GuardianPreviewNative]::SendMessage($password, 0xe, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
     if ($draftLength -ne 'fake-preview-draft-only'.Length) { throw 'Navigating between pages discarded the fake password draft.' }
+    if ([GuardianPreviewNative]::SendMessage($secondary, 0x147, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 2) { throw 'Navigating between pages discarded the fake second network.' }
+    [GuardianPreviewNative]::SendMessage($secondary, 0x14e, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     [GuardianPreviewNative]::SetControlText($username, 'demo-campus') | Out-Null
     [GuardianPreviewNative]::SetControlText($password, '') | Out-Null
-    $report.Add('Unsaved fake username and password survive settings -> overview -> settings.')
+    $report.Add('Unsaved fake username, password, and second network survive settings -> overview -> settings.')
     $combo = [GuardianPreviewNative]::GetDlgItem($Window, 101)
     [GuardianPreviewNative]::SendMessage($combo, 0x14e, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     [GuardianPreviewNative]::SendMessage($combo, 0x100, [IntPtr]40, [IntPtr]::Zero) | Out-Null

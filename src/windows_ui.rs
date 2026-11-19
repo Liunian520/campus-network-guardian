@@ -5,6 +5,22 @@ mod theme;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tray_menu_summarizes_networks_without_expanding_to_full_status_text() {
+        assert_eq!(
+            super::connection_heading(
+                "Wi-Fi：校园网在线\r\n以太网：校园网在线\r\n系统选路：校园网 IPv4 首选 WHUT-ISP"
+            ),
+            "校园网已连接"
+        );
+        assert_eq!(
+            super::connection_heading(
+                "Wi-Fi：校园网在线\r\n以太网：校园网络不匹配或不可用，已暂停"
+            ),
+            "连接需要关注"
+        );
+    }
+
+    #[test]
     fn status_badge_only_calls_the_exact_online_state_online() {
         assert_eq!(
             super::connection_tone("校园网在线"),
@@ -43,6 +59,61 @@ mod tests {
             super::connection_tone("正在检查网络"),
             super::ConnectionTone::Pending
         );
+    }
+    #[test]
+    fn dual_connection_status_requires_both_networks_online() {
+        assert_eq!(
+            super::connection_tone("Wi-Fi：校园网在线\r\n以太网：校园网在线"),
+            super::ConnectionTone::Online
+        );
+        assert_eq!(
+            super::connection_tone("Wi-Fi：校园网在线\r\n以太网：正在等待认证或运营商拨号结果"),
+            super::ConnectionTone::Pending
+        );
+        assert_eq!(
+            super::connection_tone(
+                "Wi-Fi：校园网在线\r\n以太网：门户未接受登录，请打开认证页面检查"
+            ),
+            super::ConnectionTone::Attention
+        );
+    }
+    #[test]
+    fn dual_connection_notification_only_reports_new_actionable_statuses() {
+        let old =
+            "Wi-Fi：需要人工处理验证码，请打开认证页面\r\n以太网：正在等待认证或运营商拨号结果";
+        let ethernet_online = "Wi-Fi：需要人工处理验证码，请打开认证页面\r\n以太网：校园网在线";
+        let ethernet_error = "Wi-Fi：需要人工处理验证码，请打开认证页面\r\n以太网：门户未接受登录，请打开认证页面检查";
+        assert!(!super::should_notify(old, ethernet_online));
+        assert!(super::should_notify(old, ethernet_error));
+    }
+    #[test]
+    fn route_policy_status_does_not_change_the_campus_connection_tone() {
+        let online = "Wi-Fi：校园网在线\r\n以太网：校园网在线";
+        let offline = "Wi-Fi：校园网在线\r\n以太网：正在等待认证或运营商拨号结果";
+        let route = "系统选路：需要以管理员身份运行才能自动切换";
+        assert_eq!(
+            super::connection_tone(&format!("{online}\r\n{route}")),
+            super::ConnectionTone::Online,
+        );
+        assert_eq!(
+            super::connection_tone(&format!("{offline}\r\n{route}")),
+            super::ConnectionTone::Pending,
+        );
+        assert_eq!(
+            super::connection_tone(route),
+            super::ConnectionTone::Pending
+        );
+    }
+    #[test]
+    fn route_policy_status_never_triggers_an_authentication_notification() {
+        let campus = "Wi-Fi：校园网在线\r\n以太网：校园网在线";
+        let before = format!("{campus}\r\n系统选路：首选 WHUT-ISP");
+        let route_issue = format!("{campus}\r\n系统选路：自动操作已暂停，请人工处理");
+        assert!(!super::should_notify(&before, &route_issue));
+        assert!(super::should_notify(
+            &before,
+            "Wi-Fi：需要人工处理验证码，请打开认证页面\r\n以太网：校园网在线\r\n系统选路：以太网兜底"
+        ));
     }
     #[test]
     fn quit_invalidates_inflight_before_worker_handles_event() {
@@ -122,10 +193,59 @@ mod tests {
     }
     #[test]
     fn requires_explicit_consent_before_saving() {
-        assert!(super::settings_allowed("adapter-1", "alice", true));
-        assert!(!super::settings_allowed("adapter-1", "alice", false));
-        assert!(!super::settings_allowed("", "alice", true));
-        assert!(!super::settings_allowed("adapter-1", "", true));
+        assert!(super::settings_allowed("adapter-1", "", "alice", true));
+        assert!(super::settings_allowed(
+            "adapter-1",
+            "adapter-2",
+            "alice",
+            true
+        ));
+        assert!(!super::settings_allowed(
+            "adapter-1",
+            "adapter-1",
+            "alice",
+            true
+        ));
+        assert!(!super::settings_allowed("adapter-1", "", "alice", false));
+        assert!(!super::settings_allowed("", "adapter-2", "alice", true));
+        assert!(!super::settings_allowed("adapter-1", "", "", true));
+    }
+    #[test]
+    fn adapter_options_keep_both_saved_networks_when_they_disconnect() {
+        let settings = super::Settings {
+            adapter_id: "known-wifi".into(),
+            secondary_adapter_id: "known-ethernet".into(),
+            ..Default::default()
+        };
+        let connected = vec![super::Adapter {
+            id: "known-wifi".into(),
+            name: "Wi-Fi / WHUT-ISP".into(),
+        }];
+        let adapters = super::adapter_options(connected, &settings, ["", ""]);
+        assert_eq!(adapters.len(), 2);
+        assert_eq!(adapters[0].name, "Wi-Fi / WHUT-ISP");
+        assert_eq!(adapters[1].id, "known-ethernet");
+        assert!(adapters[1].name.contains("当前未连接"));
+        let disconnected = super::adapter_options(Vec::new(), &settings, ["", ""]);
+        assert_eq!(disconnected.len(), 2);
+        assert_eq!(disconnected[0].id, "known-wifi");
+        assert_eq!(disconnected[1].id, "known-ethernet");
+    }
+
+    #[test]
+    fn adapter_options_do_not_turn_a_disconnected_draft_into_no_secondary() {
+        let settings = super::Settings {
+            adapter_id: "known-wifi".into(),
+            secondary_adapter_id: "known-ethernet".into(),
+            ..Default::default()
+        };
+        let adapters = super::adapter_options(Vec::new(), &settings, ["known-wifi", "draft"]);
+        assert!(adapters
+            .iter()
+            .any(|adapter| adapter.id == "known-ethernet"));
+        assert!(adapters
+            .iter()
+            .any(|adapter| adapter.id == "draft" && adapter.name.contains("当前未连接")));
     }
 
     #[test]
@@ -253,18 +373,37 @@ enum ConnectionTone {
     Pending,
 }
 fn connection_tone(status: &str) -> ConnectionTone {
-    if status == "校园网在线" {
+    let mut messages = campus_status_lines(status).map(status_message);
+    if messages.next() == Some("校园网在线") && messages.all(|message| message == "校园网在线")
+    {
         ConnectionTone::Online
     } else if should_notify("", status)
-        || status.contains("暂停")
-        || status.contains("人工处理")
-        || status.contains("密码有误")
-        || status.contains("账号异常")
+        || campus_status_lines(status).any(|line| {
+            line.contains("暂停")
+                || line.contains("人工处理")
+                || line.contains("密码有误")
+                || line.contains("账号异常")
+        })
     {
         ConnectionTone::Attention
     } else {
         ConnectionTone::Pending
     }
+}
+fn campus_status_lines(status: &str) -> impl Iterator<Item = &str> {
+    status
+        .lines()
+        .filter(|line| !line.starts_with("系统选路："))
+}
+fn connection_heading(status: &str) -> &'static str {
+    match connection_tone(status) {
+        ConnectionTone::Online => "校园网已连接",
+        ConnectionTone::Attention => "连接需要关注",
+        ConnectionTone::Pending => "正在确认连接",
+    }
+}
+fn status_message(line: &str) -> &str {
+    line.split_once('：').map_or(line, |(_, message)| message)
 }
 fn settings_failure_message(error: &str) -> String {
     format!("{error}\n自动操作已暂停，请重新保存设置后恢复。")
@@ -297,21 +436,24 @@ unsafe fn matches_terminated_username(stored: *const u16, expected: &str) -> boo
     *stored.add(index) == 0
 }
 fn should_notify(old: &str, new: &str) -> bool {
-    old != new
-        && (new.contains("人工处理")
-            || new.contains("自动操作已暂停")
-            || new.contains("自动登录已暂停")
-            || matches!(
-                new,
-                "登录预检提示密码有误，请检查并重新保存设置"
-                    | "登录预检提示账号异常，请打开认证页面检查"
-                    | "登录预检提示认证参数异常，请打开认证页面检查"
-                    | "登录预检未通过，请打开认证页面检查"
-                    | "门户提示密码有误，请检查并重新保存设置"
-                    | "门户提示账号异常，请打开认证页面检查"
-                    | "门户提示认证参数异常，请打开认证页面检查"
-                    | "门户未接受登录，请打开认证页面检查"
-            ))
+    campus_status_lines(new).any(|line| {
+        let message = status_message(line);
+        !old.lines().any(|previous| previous == line)
+            && (message.contains("人工处理")
+                || message.contains("自动操作已暂停")
+                || message.contains("自动登录已暂停")
+                || matches!(
+                    message,
+                    "登录预检提示密码有误，请检查并重新保存设置"
+                        | "登录预检提示账号异常，请打开认证页面检查"
+                        | "登录预检提示认证参数异常，请打开认证页面检查"
+                        | "登录预检未通过，请打开认证页面检查"
+                        | "门户提示密码有误，请检查并重新保存设置"
+                        | "门户提示账号异常，请打开认证页面检查"
+                        | "门户提示认证参数异常，请打开认证页面检查"
+                        | "门户未接受登录，请打开认证页面检查"
+                ))
+    })
 }
 fn copy_utf16(text: &str, output: &mut [u16]) {
     output.fill(0);
@@ -326,8 +468,8 @@ fn copy_utf16(text: &str, output: &mut [u16]) {
         position += encoded.len();
     }
 }
-fn settings_allowed(adapter: &str, username: &str, consent: bool) -> bool {
-    !adapter.trim().is_empty() && !username.trim().is_empty() && consent
+fn settings_allowed(adapter: &str, secondary: &str, username: &str, consent: bool) -> bool {
+    !adapter.trim().is_empty() && adapter != secondary && !username.trim().is_empty() && consent
 }
 fn autostart_value_matches(kind: u32, value: &[u8], exe: &str) -> bool {
     if kind != 1 || value.len() % 2 != 0 {
@@ -355,9 +497,31 @@ pub struct Adapter {
 #[derive(Clone, Debug, Default)]
 pub struct Settings {
     pub adapter_id: String,
+    pub secondary_adapter_id: String,
     pub username: String,
     pub http_acknowledged: bool,
     pub autostart: bool,
+}
+const DISCONNECTED_LABEL: &str = "（当前未连接）";
+fn adapter_options(
+    mut connected: Vec<Adapter>,
+    saved: &Settings,
+    draft: [&str; 2],
+) -> Vec<Adapter> {
+    for (id, label) in [
+        (saved.adapter_id.as_str(), "已保存的主网络"),
+        (saved.secondary_adapter_id.as_str(), "已保存的第二个网络"),
+        (draft[0], "待保存的主网络"),
+        (draft[1], "待保存的第二个网络"),
+    ] {
+        if !id.is_empty() && !connected.iter().any(|adapter| adapter.id == id) {
+            connected.push(Adapter {
+                id: id.into(),
+                name: format!("{label}{DISCONNECTED_LABEL}"),
+            });
+        }
+    }
+    connected
 }
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -397,10 +561,10 @@ fn notify_quit(
 mod win {
     use super::theme;
     use super::{
-        autostart_value_matches, connection_tone, copy_utf16, matches_terminated_username,
-        notify_network_change, notify_quit, scale_for_dpi, settings_allowed,
-        settings_failure_message, settings_transaction, should_notify, Adapter, ConnectionTone,
-        Event, Settings,
+        adapter_options, autostart_value_matches, connection_heading, copy_utf16,
+        matches_terminated_username, notify_network_change, notify_quit, scale_for_dpi,
+        settings_allowed, settings_failure_message, settings_transaction, should_notify, Adapter,
+        Event, Settings, DISCONNECTED_LABEL,
     };
     use std::{
         cell::RefCell,
@@ -468,6 +632,9 @@ mod win {
     const C_FORM_AUTOMATION: usize = 132;
     const C_HTTP_HINT: usize = 133;
     const C_ADAPTER_DETAIL: usize = 134;
+    const C_SECONDARY_ADAPTER: usize = 135;
+    const C_LABEL_ADAPTER: usize = 136;
+    const C_LABEL_SECONDARY_ADAPTER: usize = 137;
     const C_NAV_OVERVIEW: usize = 301;
     const C_NAV_SETTINGS: usize = 302;
     const C_AUTHOR: usize = 303;
@@ -476,11 +643,12 @@ mod win {
     const M_SETTINGS: usize = 202;
     const M_OPEN: usize = 203;
     const M_QUIT: usize = 204;
-    const M_ABOUT: usize = 205;
     const WS_CHILD: u32 = 0x40000000;
     const WS_VISIBLE: u32 = 0x10000000;
     const WS_TABSTOP: u32 = 0x10000;
     const CONTENT_HEIGHT: i32 = 600;
+    const NETWORK_FIELD_ROW_HEIGHT: i32 = 24;
+    const ADAPTER_COMBO_WIDTH: i32 = 220;
     const HKEY_CURRENT_USER: Handle = 0x80000001u32 as i32 as isize;
     #[repr(C)]
     struct Point {
@@ -1152,7 +1320,7 @@ mod win {
     static mut NETWORK_TEXT_HEIGHT: i32 = 28;
     static mut OVERVIEW_HEIGHT: i32 = CONTENT_HEIGHT;
     static mut FORM_SHIFT: i32 = 0;
-    static mut FORM_NETWORK_EXTRA: i32 = 0;
+    static mut FORM_NETWORK_EXTRA: i32 = NETWORK_FIELD_ROW_HEIGHT;
     static mut FORM_ERROR_FIELD: usize = 0;
     unsafe fn app() -> Option<&'static App> {
         APP.as_ref()
@@ -1343,7 +1511,7 @@ mod win {
         }
         // The combo remains a native keyboard- and accessibility-aware dropdown.
         // Only its closed surface is painted to match the rounded input shell.
-        if !HIGH_CONTRAST && GetDlgCtrlID(h) as usize == C_ADAPTER {
+        if !HIGH_CONTRAST && matches!(GetDlgCtrlID(h) as usize, C_ADAPTER | C_SECONDARY_ADAPTER) {
             if m == 0xf {
                 let mut paint: Paint = zeroed();
                 let dc = BeginPaint(h, &mut paint);
@@ -1379,9 +1547,13 @@ mod win {
         paint_label(
             dc,
             if placeholder {
-                "选择校园网络"
+                if GetDlgCtrlID(h) as usize == C_SECONDARY_ADAPTER {
+                    "不守护第二个网络"
+                } else {
+                    "选择校园网络"
+                }
             } else {
-                &selected
+                adapter_caption(&selected)
             },
             bounds,
             UI_FONT,
@@ -1408,6 +1580,10 @@ mod win {
         );
         SelectObject(dc, old);
         DeleteObject(pen);
+    }
+    fn adapter_caption(name: &str) -> &str {
+        name.rsplit_once(" / 网关 ")
+            .map_or(name, |(caption, _)| caption)
     }
     unsafe fn single_line_width(dc: Handle, value: &str) -> i32 {
         let mut bounds: Rect = zeroed();
@@ -1650,7 +1826,12 @@ mod win {
                 let shift = if item.page == 2
                     && !matches!(id, C_SETTINGS_TITLE | C_FORM_SUBTITLE | C_FORM_FEEDBACK)
                 {
-                    FORM_SHIFT + if item.y >= 200 { FORM_NETWORK_EXTRA } else { 0 }
+                    FORM_SHIFT
+                        + if item.y >= 200 && id != C_ADAPTER_DETAIL {
+                            FORM_NETWORK_EXTRA
+                        } else {
+                            0
+                        }
                 } else {
                     0
                 };
@@ -1721,48 +1902,58 @@ mod win {
     }
     unsafe fn refresh_adapters(h: Handle) {
         if let Some(app) = app() {
-            let combo = GetDlgItem(h, C_ADAPTER as i32);
-            let index = SendMessageW(combo, 0x147, 0, 0);
-            let selected = if index >= 0 {
-                app.adapters
-                    .borrow()
-                    .get(index as usize)
-                    .map(|a| a.id.clone())
-            } else {
-                None
+            let (primary, secondary) = {
+                let adapters = app.adapters.borrow();
+                (
+                    chosen_adapter(h, C_ADAPTER, &adapters).map(|adapter| adapter.id.clone()),
+                    chosen_adapter(h, C_SECONDARY_ADAPTER, &adapters)
+                        .map(|adapter| adapter.id.clone()),
+                )
             };
-            let adapters = (app.adapter_source)();
-            SendMessageW(combo, 0x14b, 0, 0);
-            for adapter in &adapters {
-                SendMessageW(combo, 0x143, 0, wide(&adapter.name).as_ptr() as isize);
-            }
-            let next = selected
-                .and_then(|id| adapters.iter().position(|a| a.id == id))
-                .map(|n| n as isize)
-                .unwrap_or(-1);
-            *app.adapters.borrow_mut() = adapters;
-            SendMessageW(combo, 0x14e, next as usize, 0);
-            update_adapter_detail(h);
+            populate_adapter_choices(
+                h,
+                app,
+                primary.as_deref().unwrap_or_default(),
+                secondary.as_deref().unwrap_or_default(),
+            );
             update_overview(h);
         }
     }
+    unsafe fn chosen_adapter(h: Handle, id: usize, adapters: &[Adapter]) -> Option<&Adapter> {
+        let index = SendMessageW(GetDlgItem(h, id as i32), 0x147, 0, 0) as i32;
+        let offset = usize::from(id == C_SECONDARY_ADAPTER);
+        adapters.get(usize::try_from(index).ok()?.checked_sub(offset)?)
+    }
+    unsafe fn populate_adapter_choices(h: Handle, app: &App, primary: &str, secondary: &str) {
+        let adapters = adapter_options(
+            (app.adapter_source)(),
+            &app.settings.borrow(),
+            [primary, secondary],
+        );
+        for (id, selected) in [(C_ADAPTER, primary), (C_SECONDARY_ADAPTER, secondary)] {
+            let combo = GetDlgItem(h, id as i32);
+            let optional = id == C_SECONDARY_ADAPTER;
+            SendMessageW(combo, 0x14b, 0, 0);
+            if optional {
+                SendMessageW(combo, 0x143, 0, wide("不守护第二个网络").as_ptr() as isize);
+            }
+            for adapter in &adapters {
+                SendMessageW(combo, 0x143, 0, wide(&adapter.name).as_ptr() as isize);
+            }
+            let index = adapters
+                .iter()
+                .position(|adapter| adapter.id == selected)
+                .map(|position| position + usize::from(optional))
+                .unwrap_or(if optional { 0 } else { usize::MAX });
+            SendMessageW(combo, 0x14e, index, 0);
+        }
+        *app.adapters.borrow_mut() = adapters;
+        update_adapter_detail(h);
+    }
     unsafe fn reset_form(h: Handle) {
         if let Some(app) = app() {
-            let combo = GetDlgItem(h, C_ADAPTER as i32);
-            let adapters = (app.adapter_source)();
             let settings = app.settings.borrow().clone();
-            SendMessageW(combo, 0x14b, 0, 0);
-            for a in &adapters {
-                SendMessageW(combo, 0x143, 0, wide(&a.name).as_ptr() as isize);
-            }
-            let idx = adapters
-                .iter()
-                .position(|a| a.id == settings.adapter_id)
-                .map(|i| i as isize)
-                .unwrap_or(-1);
-            *app.adapters.borrow_mut() = adapters;
-            SendMessageW(combo, 0x14e, idx as usize, 0);
-            update_adapter_detail(h);
+            populate_adapter_choices(h, app, &settings.adapter_id, &settings.secondary_adapter_id);
             SetWindowTextW(
                 GetDlgItem(h, C_USER as i32),
                 wide(&settings.username).as_ptr(),
@@ -1784,37 +1975,39 @@ mod win {
         }
     }
     unsafe fn update_adapter_detail(h: Handle) {
-        let selected = SendMessageW(GetDlgItem(h, C_ADAPTER as i32), 0x147, 0, 0);
-        let name = app()
-            .and_then(|a| {
-                a.adapters
-                    .borrow()
-                    .get(selected as usize)
-                    .map(|value| value.name.clone())
-            })
-            .unwrap_or_default();
+        let Some(app) = app() else { return };
+        let adapters = app.adapters.borrow();
         let dc = GetDC(h);
-        let overflow = if dc == 0 {
-            !name.is_empty()
+        let old_font = if dc == 0 {
+            0
         } else {
-            let old = SelectObject(dc, UI_FONT);
-            let overflow = single_line_width(dc, &name) > scale_for_dpi(460, UI_DPI);
-            SelectObject(dc, old);
+            SelectObject(dc, UI_FONT)
+        };
+        let detail = [(C_ADAPTER, "主网络"), (C_SECONDARY_ADAPTER, "第二个网络")]
+            .into_iter()
+            .filter_map(|(id, label)| {
+                let adapter = chosen_adapter(h, id, &adapters)?;
+                let caption = adapter_caption(&adapter.name);
+                (dc == 0
+                    || single_line_width(dc, caption)
+                        > scale_for_dpi(ADAPTER_COMBO_WIDTH - 30, UI_DPI))
+                .then(|| format!("{label}　{}", adapter.name))
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        drop(adapters);
+        if dc != 0 {
+            SelectObject(dc, old_font);
             ReleaseDC(h, dc);
-            overflow
-        };
-        let detail = if overflow {
-            network_display_text(h, &name, SMALL_FONT, 504)
-        } else {
-            String::new()
-        };
+        }
+        let detail = network_display_text(h, &detail, SMALL_FONT, 504);
         let height = measured_height(h, &detail, SMALL_FONT, 504);
-        FORM_NETWORK_EXTRA = if height == 0 { 0 } else { height + 12 };
+        FORM_NETWORK_EXTRA = NETWORK_FIELD_ROW_HEIGHT + if height == 0 { 0 } else { height + 12 };
         SetWindowTextW(
             GetDlgItem(h, C_ADAPTER_DETAIL as i32),
             wide(&detail).as_ptr(),
         );
-        set_control_bounds(C_ADAPTER_DETAIL, 212, 188, 504, height);
+        set_control_bounds(C_ADAPTER_DETAIL, 212, 208, 504, height);
         layout_controls(h);
         configure_scroll(h);
     }
@@ -1825,27 +2018,48 @@ mod win {
                 .lock()
                 .map(|value| value.clone())
                 .unwrap_or_else(|_| "状态不可用".into());
-            let headline = match connection_tone(&status) {
-                ConnectionTone::Online => "校园网已连接",
-                ConnectionTone::Attention => "连接需要关注",
-                ConnectionTone::Pending => "正在确认连接",
-            };
+            let headline = connection_heading(&status);
             SetWindowTextW(GetDlgItem(h, C_STATUS_HEAD as i32), wide(headline).as_ptr());
             let settings = app.settings.borrow();
-            let name = app
-                .adapters
-                .borrow()
-                .iter()
-                .find(|a| a.id == settings.adapter_id)
-                .map(|a| a.name.clone())
-                .unwrap_or_else(|| "尚未选择校园网络".into());
-            let (network, detail) = name
-                .rsplit_once(" / 网关 ")
-                .map(|(network, gateway)| (network, format!("网关 {gateway}")))
-                .unwrap_or((&name, "仅在匹配所选网络时执行认证".into()));
+            let adapters = app.adapters.borrow();
+            let name = |id: &str| {
+                adapters
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| a.name.as_str())
+                    .filter(|name| !name.ends_with(DISCONNECTED_LABEL))
+            };
+            let primary = name(&settings.adapter_id).unwrap_or(if settings.adapter_id.is_empty() {
+                "尚未选择校园网络"
+            } else {
+                "已保存"
+            });
+            let dual = !settings.secondary_adapter_id.is_empty();
+            let (network, detail) = if dual {
+                let secondary = name(&settings.secondary_adapter_id).unwrap_or("已保存");
+                (
+                    format!("主网络　{primary}\r\n第二个网络　{secondary}"),
+                    "仅在匹配所选网络时执行认证".into(),
+                )
+            } else {
+                primary
+                    .rsplit_once(" / 网关 ")
+                    .map(|(network, gateway)| (network.to_owned(), format!("网关 {gateway}")))
+                    .unwrap_or_else(|| (primary.into(), "仅在匹配所选网络时执行认证".into()))
+            };
+            drop(adapters);
+            SetWindowTextW(
+                GetDlgItem(h, C_NETWORK_LABEL as i32),
+                wide(if dual {
+                    "已选校园网络"
+                } else {
+                    "当前校园网络"
+                })
+                .as_ptr(),
+            );
             SetWindowTextW(
                 GetDlgItem(h, C_NETWORK_VALUE as i32),
-                wide(&network_display_text(h, network, UI_FONT, 496)).as_ptr(),
+                wide(&network_display_text(h, &network, UI_FONT, 496)).as_ptr(),
             );
             SetWindowTextW(GetDlgItem(h, C_NETWORK_DESC as i32), wide(&detail).as_ptr());
             update_overview_layout(h);
@@ -1854,22 +2068,26 @@ mod win {
     }
     unsafe fn save_form(h: Handle) {
         if let Some(app) = app() {
-            let idx = SendMessageW(GetDlgItem(h, C_ADAPTER as i32), 0x147, 0, 0);
-            let id = if idx >= 0 {
-                app.adapters
-                    .borrow()
-                    .get(idx as usize)
-                    .map(|a| a.id.clone())
-                    .unwrap_or_default()
-            } else {
-                String::new()
+            let (id, secondary_id) = {
+                let adapters = app.adapters.borrow();
+                let selected = |field| {
+                    chosen_adapter(h, field, &adapters)
+                        .map(|a| a.id.clone())
+                        .unwrap_or_default()
+                };
+                (selected(C_ADAPTER), selected(C_SECONDARY_ADAPTER))
             };
             let username = text(h, C_USER);
             let consent = SendMessageW(GetDlgItem(h, C_CONSENT as i32), 0xf0, 0, 0) == 1;
             let autostart = SendMessageW(GetDlgItem(h, C_START as i32), 0xf0, 0, 0) == 1;
-            if !settings_allowed(&id, &username, consent) {
+            if !settings_allowed(&id, &secondary_id, &username, consent) {
                 let (message, field) = if id.trim().is_empty() {
                     ("请选择当前连接校园网的网卡。", C_ADAPTER)
+                } else if id == secondary_id {
+                    (
+                        "主网络和第二个网络选择了同一张网卡。请选择另一张网卡，或取消第二个网络。",
+                        C_SECONDARY_ADAPTER,
+                    )
                 } else if username.trim().is_empty() {
                     ("请填写校园网账号。", C_USER)
                 } else {
@@ -1908,6 +2126,7 @@ mod win {
             };
             let settings = Settings {
                 adapter_id: id,
+                secondary_adapter_id: secondary_id,
                 username: username.trim().to_string(),
                 http_acknowledged: consent,
                 autostart,
@@ -1972,11 +2191,10 @@ mod win {
                 .lock()
                 .map(|s| s.clone())
                 .unwrap_or_else(|_| "状态不可用".into());
-            AppendMenuW(m, 3, 0, wide(&status).as_ptr());
+            AppendMenuW(m, 3, 0, wide(connection_heading(&status)).as_ptr());
             AppendMenuW(m, 0, M_CHECK, wide("立即检查").as_ptr());
             AppendMenuW(m, 0, M_SETTINGS, wide("设置").as_ptr());
-            AppendMenuW(m, 0, M_OPEN, wide("打开校园网认证页面").as_ptr());
-            AppendMenuW(m, 0, M_ABOUT, wide("关于校园网守护").as_ptr());
+            AppendMenuW(m, 0, M_OPEN, wide("认证页面").as_ptr());
             AppendMenuW(m, 0, M_QUIT, wide("退出").as_ptr());
             let mut p = Point { x: 0, y: 0 };
             GetCursorPos(&mut p);
@@ -2221,7 +2439,8 @@ mod win {
             for (id, x, y, width) in [
                 (C_USER, 212, 272, 240),
                 (C_PASS, 476, 272, 240),
-                (C_ADAPTER, 212, 136, 504),
+                (C_ADAPTER, 212, 158, 240),
+                (C_SECONDARY_ADAPTER, 476, 158, 240),
             ] {
                 let shift = FORM_SHIFT + if y >= 200 { FORM_NETWORK_EXTRA } else { 0 };
                 let bounds = dip_rect(x, y + shift, width, 40, true);
@@ -2672,14 +2891,17 @@ mod win {
             WM_COMMAND => {
                 let id = w & 0xffff;
                 let notification = w >> 16;
-                if id == C_ADAPTER && notification == 1 {
+                let adapter_changed =
+                    matches!(id, C_ADAPTER | C_SECONDARY_ADAPTER) && notification == 1;
+                if adapter_changed {
                     update_adapter_detail(h);
                 }
                 if FORM_ERROR_FIELD != 0
-                    && id == FORM_ERROR_FIELD
-                    && ((matches!(id, C_USER | C_PASS) && notification == 0x300)
-                        || (id == C_ADAPTER && notification == 1)
-                        || (id == C_CONSENT && notification == 0))
+                    && ((id == FORM_ERROR_FIELD
+                        && ((matches!(id, C_USER | C_PASS) && notification == 0x300)
+                            || adapter_changed
+                            || (id == C_CONSENT && notification == 0)))
+                        || (adapter_changed && FORM_ERROR_FIELD == C_SECONDARY_ADAPTER))
                 {
                     form_feedback(h, "", 0);
                 }
@@ -2699,7 +2921,7 @@ mod win {
                             alert(h, "无法打开浏览器。作者主页：https://github.com/Liunian520");
                         }
                     }
-                    C_ABOUT | M_ABOUT => show_about(h),
+                    C_ABOUT => show_about(h),
                     C_SAVE => save_form(h),
                     C_DELETE => {
                         let Some(app) = app() else {
@@ -3045,24 +3267,32 @@ mod win {
                 40,
                 C_HINT_NETWORK,
             );
-            control(
-                h,
-                "COMBOBOX",
-                "",
-                WS_TABSTOP | 0x3 | 0x200000,
-                222,
-                142,
-                484,
-                210,
-                C_ADAPTER,
-            );
-            SendMessageW(
-                GetDlgItem(h, C_ADAPTER as i32),
-                0x153,
-                usize::MAX,
-                scale_for_dpi(23, UI_DPI) as isize,
-            );
-            control(h, "STATIC", "", 0, 212, 188, 504, 0, C_ADAPTER_DETAIL);
+            for (x, label, label_id, combo_id) in [
+                (212, "主网络", C_LABEL_ADAPTER, C_ADAPTER),
+                (
+                    476,
+                    "第二个网络（可选）",
+                    C_LABEL_SECONDARY_ADAPTER,
+                    C_SECONDARY_ADAPTER,
+                ),
+            ] {
+                control(h, "STATIC", label, 0, x, 134, 240, 20, label_id);
+                control(
+                    h,
+                    "COMBOBOX",
+                    "",
+                    WS_TABSTOP | 0x3 | 0x200000,
+                    x + 10,
+                    164,
+                    ADAPTER_COMBO_WIDTH,
+                    210,
+                    combo_id,
+                );
+                let combo = GetDlgItem(h, combo_id as i32);
+                SendMessageW(combo, 0x153, usize::MAX, scale_for_dpi(23, UI_DPI) as isize);
+                SendMessageW(combo, 0x160, scale_for_dpi(360, UI_DPI) as usize, 0);
+            }
+            control(h, "STATIC", "", 0, 212, 208, 504, 0, C_ADAPTER_DETAIL);
             control(
                 h,
                 "STATIC",
@@ -3107,7 +3337,7 @@ mod win {
             control(
                 h,
                 "STATIC",
-                "密码由 Windows 凭据管理器保存；留空保留原密码。",
+                "所选网络共用账号和密码。密码保存在 Windows 凭据管理器中，留空时沿用。",
                 0,
                 212,
                 320,
@@ -3129,7 +3359,7 @@ mod win {
             control(
                 h,
                 "BUTTON",
-                "我了解并同意使用 HTTP 自动认证",
+                "我了解并同意通过 HTTP 认证所选网络",
                 WS_TABSTOP | 3,
                 212,
                 414,
