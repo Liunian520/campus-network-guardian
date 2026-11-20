@@ -611,6 +611,20 @@ pub struct Settings {
     pub http_acknowledged: bool,
     pub autostart: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    Current,
+    Installing,
+    Failed,
+}
+
+pub struct UiUpdates {
+    pub request: Box<dyn Fn()>,
+    pub status: Box<dyn Fn() -> UpdateState>,
+}
+
 const DISCONNECTED_LABEL: &str = "（当前未连接）";
 const TRAY_ICON_ID: u32 = 1;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
@@ -722,7 +736,7 @@ mod win {
         adapter_options, autostart_value_matches, connection_heading, copy_utf16,
         matches_terminated_username, notify_network_change, notify_quit, overview_network_text,
         scale_for_dpi, settings_allowed, settings_failure_message, settings_transaction,
-        should_notify, Adapter, Event, PanelWidth, Settings,
+        should_notify, Adapter, Event, PanelWidth, Settings, UiUpdates, UpdateState,
     };
     use super::{tray_action, TrayAction, TRAY_ICON_ID, WM_LBUTTONDBLCLK};
     use std::{
@@ -736,6 +750,7 @@ mod win {
             mpsc::{self, Sender},
             Arc, Mutex,
         },
+        time::{Duration, Instant},
     };
     type Handle = isize;
     const TARGET: &str = "CampusNetworkGuardian/Portal";
@@ -757,6 +772,7 @@ mod win {
     const NOTIFYICON_VERSION_4: u32 = 4;
     const WM_DESTROY: u32 = 2;
     const WM_CLOSE: u32 = 0x10;
+    const WM_SETTINGCHANGE: u32 = 0x1a;
     const WM_COMMAND: u32 = 0x111;
     const WM_TIMER: u32 = 0x113;
     const WM_POWERBROADCAST: u32 = 0x218;
@@ -807,6 +823,8 @@ mod win {
     const C_NAV_SETTINGS: usize = 302;
     const C_AUTHOR: usize = 303;
     const C_ABOUT: usize = 304;
+    const C_UPDATE: usize = 305;
+    const C_PAGE_SCROLL: usize = 306;
     const M_CHECK: usize = 201;
     const M_SETTINGS: usize = 202;
     const M_OPEN: usize = 203;
@@ -815,6 +833,10 @@ mod win {
     const WS_CHILD: u32 = 0x40000000;
     const WS_VISIBLE: u32 = 0x10000000;
     const WS_TABSTOP: u32 = 0x10000;
+    const SB_CTL: i32 = 2;
+    const OBJID_CLIENT: i32 = -4;
+    const SCROLL_REVEAL_TIMER: usize = 2;
+    const SCROLL_REVEAL_MS: u32 = 850;
     const CONTENT_HEIGHT: i32 = 600;
     const COMPACT_OVERVIEW_HEIGHT: i32 = 360;
     const COMPACT_OVERVIEW_SHIFT: i32 = 32;
@@ -842,6 +864,16 @@ mod win {
         page: u32,
         position: i32,
         track_position: i32,
+    }
+    #[repr(C)]
+    struct ScrollBarInfo {
+        size: u32,
+        bounds: Rect,
+        arrow_size: i32,
+        thumb_top: i32,
+        thumb_bottom: i32,
+        reserved: i32,
+        state: [u32; 6],
     }
     #[repr(C)]
     struct DrawItem {
@@ -1035,11 +1067,13 @@ mod win {
         fn ReleaseDC(h: Handle, dc: Handle) -> i32;
         fn GetWindowRect(h: Handle, rect: *mut Rect) -> i32;
         fn GetFocus() -> Handle;
+        fn GetCapture() -> Handle;
         fn SetFocus(h: Handle) -> Handle;
         fn GetParent(h: Handle) -> Handle;
         fn MapWindowPoints(from: Handle, to: Handle, points: *mut Point, count: u32) -> i32;
         fn GetScrollInfo(h: Handle, bar: i32, info: *mut ScrollInfo) -> i32;
         fn SetScrollInfo(h: Handle, bar: i32, info: *const ScrollInfo, redraw: i32) -> i32;
+        fn GetScrollBarInfo(h: Handle, object: i32, info: *mut ScrollBarInfo) -> i32;
         fn ShowScrollBar(h: Handle, bar: i32, show: i32) -> i32;
         fn AdjustWindowRectEx(rect: *mut Rect, style: u32, menu: i32, ex: u32) -> i32;
         fn FillRect(dc: Handle, rect: *const Rect, brush: Handle) -> i32;
@@ -1112,6 +1146,18 @@ mod win {
             height: i32,
         ) -> i32;
         fn Ellipse(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
+        #[link_name = "Arc"]
+        fn GdiArc(
+            dc: Handle,
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            start_x: i32,
+            start_y: i32,
+            end_x: i32,
+            end_y: i32,
+        ) -> i32;
         fn MoveToEx(dc: Handle, x: i32, y: i32, previous: *mut Point) -> i32;
         fn LineTo(dc: Handle, x: i32, y: i32) -> i32;
     }
@@ -1141,6 +1187,15 @@ mod win {
         fn CredReadW(target: *const u16, kind: u32, flags: u32, c: *mut *mut Credential) -> i32;
         fn CredDeleteW(target: *const u16, kind: u32, flags: u32) -> i32;
         fn CredFree(c: *mut c_void);
+        fn RegGetValueW(
+            key: Handle,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> u32;
         fn RegOpenKeyExW(
             key: Handle,
             sub: *const u16,
@@ -1471,6 +1526,8 @@ mod win {
         tray_available: Cell<bool>,
         taskbar_created: u32,
         last_status: RefCell<String>,
+        update: UiUpdates,
+        update_state: Cell<Option<UpdateState>>,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
     }
@@ -1508,6 +1565,9 @@ mod win {
     static mut APP_ICON: Handle = 0;
     static mut HIGH_CONTRAST: bool = false;
     static mut SCROLL_OFFSET: i32 = 0;
+    static mut SCROLL_HOVERED: bool = false;
+    static mut SCROLL_ALWAYS_VISIBLE: bool = false;
+    static mut SCROLL_REVEALED_UNTIL: Option<Instant> = None;
     static mut ACTIVE_PAGE: u8 = 1;
     static mut BUILD_PAGE: u8 = 0;
     static mut HOVERED_BUTTON: Handle = 0;
@@ -1553,9 +1613,41 @@ mod win {
     fn application_version() -> &'static str {
         option_env!("CARGO_PKG_VERSION").unwrap_or("0.5.1")
     }
+    fn update_caption(state: UpdateState) -> (&'static str, &'static str) {
+        match state {
+            UpdateState::Idle => ("检查更新", ""),
+            UpdateState::Checking => ("正在检查", "正在检查更新"),
+            UpdateState::Current => ("已是最新版", "已是最新版本"),
+            UpdateState::Installing => ("正在安装", "正在安装更新"),
+            UpdateState::Failed => ("重试更新", "更新未完成"),
+        }
+    }
+    unsafe fn refresh_update_card(h: Handle) {
+        let Some(app) = app() else { return };
+        let state = (app.update.status)();
+        let changed = app.update_state.replace(Some(state)) != Some(state);
+        if !changed && !HIGH_CONTRAST {
+            return;
+        }
+        let (compact_title, detail) = update_caption(state);
+        let native_label = if HIGH_CONTRAST && viewport_height(h) < SIDEBAR_CARD_MIN_HEIGHT {
+            compact_title.to_owned()
+        } else if detail.is_empty() {
+            format!("检查更新\r\n当前版本 v{}", application_version())
+        } else {
+            format!("检查更新\r\n{detail}")
+        };
+        let control = GetDlgItem(h, C_UPDATE as i32);
+        if text(h, C_UPDATE) != native_label {
+            SetWindowTextW(control, wide(&native_label).as_ptr());
+        }
+        if changed {
+            InvalidateRect(control, null(), 0);
+        }
+    }
     unsafe fn show_about(h: Handle) {
         let message = format!(
-            "校园网守护  v{}\r\n武汉理工大学校园网连接助手\r\n\r\n作者  Liunian520\r\n开源许可  MIT\r\n\r\n{}\r\n可点击侧栏作者署名，在浏览器中打开 GitHub 主页。",
+            "校园网守护  v{}\r\n武汉理工大学校园网连接助手\r\n\r\n作者  Liunian520\r\n开源许可  MIT\r\n\r\n{}\r\n侧栏可打开 GitHub 主页或检查更新。",
             application_version(),
             AUTHOR_URL
         );
@@ -2044,17 +2136,27 @@ mod win {
             OVERVIEW_HEIGHT
         }
     }
+    const SIDEBAR_CARD_MIN_HEIGHT: i32 = 368;
     unsafe fn layout_controls(h: Handle) {
         let viewport_height = viewport_height(h);
         let compact_overview = viewport_height < COMPACT_OVERVIEW_HEIGHT;
         let compact_sidebar = viewport_height < 328;
         let footer_visible = viewport_height >= 208;
-        let footer_top = if compact_sidebar {
-            (viewport_height - 56).max(160)
+        let split_footer = viewport_height < 272;
+        let tall_footer = viewport_height >= SIDEBAR_CARD_MIN_HEIGHT;
+        let footer_top = if split_footer {
+            viewport_height - 52
+        } else if tall_footer {
+            viewport_height - 152
         } else {
-            viewport_height - 120
+            viewport_height - 108
         };
-        if !footer_visible && matches!(GetDlgCtrlID(GetFocus()) as usize, C_AUTHOR | C_ABOUT) {
+        if !footer_visible
+            && matches!(
+                GetDlgCtrlID(GetFocus()) as usize,
+                C_AUTHOR | C_UPDATE | C_ABOUT
+            )
+        {
             SetFocus(GetDlgItem(
                 h,
                 if ACTIVE_PAGE == 2 {
@@ -2067,37 +2169,36 @@ mod win {
         LAYOUT.with(|layout| {
             for item in layout.borrow().iter() {
                 let id = GetDlgCtrlID(item.hwnd) as usize;
-                if id == C_AUTHOR {
-                    SetWindowTextW(
-                        item.hwnd,
-                        wide(if PANEL_WIDTH.sidebar < 152 {
-                            "Liunian520"
-                        } else if compact_sidebar {
-                            "Liunian520 · GitHub"
-                        } else {
-                            "Liunian520\r\n作者 · GitHub 主页"
-                        })
-                        .as_ptr(),
-                    );
+                if id == C_AUTHOR && HIGH_CONTRAST {
+                    let label = if split_footer {
+                        "作者"
+                    } else if tall_footer {
+                        "Liunian520\r\n作者 · GitHub"
+                    } else {
+                        "Liunian520"
+                    };
+                    if text(h, C_AUTHOR) != label {
+                        SetWindowTextW(item.hwnd, wide(label).as_ptr());
+                    }
                 }
                 let visible = (item.page == 0 || item.page == ACTIVE_PAGE)
-                    && (!matches!(id, C_AUTHOR | C_ABOUT) || footer_visible)
+                    && (!matches!(id, C_AUTHOR | C_UPDATE | C_ABOUT) || footer_visible)
                     && !(compact_overview && matches!(id, C_SUBTITLE | C_STATUS_LABEL));
                 ShowWindow(item.hwnd, if visible { 5 } else { 0 });
                 let offset = if item.page == 0 { 0 } else { SCROLL_OFFSET };
-                let y = match id {
-                    C_NAV_OVERVIEW if compact_sidebar => 88,
-                    C_NAV_SETTINGS if compact_sidebar => 124,
-                    C_AUTHOR if compact_sidebar => footer_top,
-                    C_ABOUT if compact_sidebar => footer_top + 24,
-                    C_AUTHOR => footer_top + 8,
-                    C_ABOUT => footer_top + 64,
-                    _ => item.y,
-                };
-                let height = match id {
-                    C_NAV_OVERVIEW | C_NAV_SETTINGS if compact_sidebar => 32,
-                    C_AUTHOR | C_ABOUT if compact_sidebar => 24,
-                    _ => item.h,
+                let (x, y, width, height) = match id {
+                    C_NAV_OVERVIEW if compact_sidebar => (item.x, 88, item.w, 32),
+                    C_NAV_SETTINGS if compact_sidebar => (item.x, 124, item.w, 32),
+                    C_AUTHOR if split_footer => (12, footer_top, 68, 24),
+                    C_UPDATE if split_footer => (84, footer_top, 72, 24),
+                    C_ABOUT if split_footer => (12, footer_top + 26, 144, 24),
+                    C_AUTHOR if tall_footer => (12, footer_top, 144, 52),
+                    C_UPDATE if tall_footer => (12, footer_top + 60, 144, 52),
+                    C_ABOUT if tall_footer => (12, footer_top + 120, 144, 24),
+                    C_AUTHOR => (12, footer_top, 144, 32),
+                    C_UPDATE => (12, footer_top + 36, 144, 32),
+                    C_ABOUT => (12, footer_top + 72, 144, 24),
+                    _ => (item.x, item.y, item.w, item.h),
                 };
                 let mut shift = if item.page == 2
                     && !matches!(id, C_SETTINGS_TITLE | C_FORM_SUBTITLE | C_FORM_FEEDBACK)
@@ -2127,8 +2228,8 @@ mod win {
                 if compact_overview && item.page == 1 && id != C_TITLE {
                     shift -= COMPACT_OVERVIEW_SHIFT;
                 }
-                let left = scale_for_dpi(PANEL_WIDTH.x(item.x), UI_DPI);
-                let right = scale_for_dpi(PANEL_WIDTH.x(item.x + item.w), UI_DPI);
+                let left = scale_for_dpi(PANEL_WIDTH.x(x), UI_DPI);
+                let right = scale_for_dpi(PANEL_WIDTH.x(x + width), UI_DPI);
                 MoveWindow(
                     item.hwnd,
                     left,
@@ -2139,6 +2240,9 @@ mod win {
                 );
             }
         });
+        if HIGH_CONTRAST {
+            refresh_update_card(h);
+        }
         InvalidateRect(h, null(), 1);
     }
     unsafe fn show_page(h: Handle, page: u8) {
@@ -2150,6 +2254,11 @@ mod win {
                 .any(|c| c.hwnd == focus && c.page != 0 && c.page != page)
         });
         HOVERED_BUTTON = 0;
+        SCROLL_REVEALED_UNTIL = None;
+        let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+        if bar != 0 {
+            KillTimer(bar, SCROLL_REVEAL_TIMER);
+        }
         ACTIVE_PAGE = page;
         // A native button exposes its window text as its accessible name. Keep
         // the current page explicit for assistive technology as well as through
@@ -2570,31 +2679,244 @@ mod win {
             }
         }
     }
+    unsafe fn always_show_page_scrollbar() -> bool {
+        #[cfg(debug_assertions)]
+        if let Ok(mode) = std::env::var("CAMPUS_UI_PREVIEW_SCROLL_MODE") {
+            return mode == "always";
+        }
+        // Windows mirrors its always-show accessibility setting here.
+        // Missing or unrecognized values keep the app's automatic behavior.
+        let mut value = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide("Control Panel\\Accessibility").as_ptr(),
+            wide("DynamicScrollbars").as_ptr(),
+            0x10,
+            null_mut(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+        ) == 0
+            && size == size_of::<u32>() as u32
+            && value == 0
+    }
+    unsafe fn paint_page_scrollbar(bar: Handle, dc: Handle) {
+        let mut bounds: Rect = zeroed();
+        GetClientRect(bar, &mut bounds);
+        FillRect(dc, &bounds, BACKGROUND_BRUSH);
+        let focused = GetFocus() == bar;
+        let pressed = GetCapture() == bar;
+        let active = SCROLL_HOVERED || focused || pressed;
+        if !active
+            && !SCROLL_ALWAYS_VISIBLE
+            && !SCROLL_REVEALED_UNTIL.is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        let mut geometry: ScrollBarInfo = zeroed();
+        geometry.size = size_of::<ScrollBarInfo>() as u32;
+        if GetScrollBarInfo(bar, OBJID_CLIENT, &mut geometry) == 0
+            || geometry.thumb_bottom <= geometry.thumb_top
+        {
+            // Offscreen and print-only controls may have a valid native range
+            // without exposing any bounding rectangles through accessibility.
+            let mut info: ScrollInfo = zeroed();
+            info.size = size_of::<ScrollInfo>() as u32;
+            info.mask = 0x1 | 0x2 | 0x4;
+            if GetScrollInfo(bar, SB_CTL, &mut info) == 0 {
+                return;
+            }
+            let length = bounds.bottom - bounds.top;
+            let range = (info.max - info.min + 1).max(1);
+            let limit = (range - info.page as i32).max(1);
+            geometry.arrow_size = GetSystemMetrics(20).min(length / 4);
+            let track = length - 2 * geometry.arrow_size;
+            let size = (track * info.page as i32 / range)
+                .max(GetSystemMetrics(9))
+                .min(track);
+            geometry.thumb_top =
+                geometry.arrow_size + (track - size) * (info.position - info.min) / limit;
+            geometry.thumb_bottom = geometry.thumb_top + size;
+        }
+        let center = (bounds.left + bounds.right) / 2;
+        if active {
+            let inset = scale_for_dpi(1, UI_DPI);
+            let track = Rect {
+                left: bounds.left + inset,
+                right: bounds.right - inset,
+                top: bounds.top,
+                bottom: bounds.bottom,
+            };
+            rounded(
+                dc,
+                &track,
+                10,
+                theme::PAGE_SCROLL_TRACK,
+                theme::PAGE_SCROLL_TRACK,
+            );
+
+            let size = scale_for_dpi(3, UI_DPI);
+            let pen = CreatePen(0, scale_for_dpi(1, UI_DPI), theme::PAGE_SCROLL_THUMB_HOVER);
+            let old_pen = SelectObject(dc, pen);
+            for (y, direction) in [
+                (bounds.top + geometry.arrow_size / 2, -1),
+                (bounds.bottom - geometry.arrow_size / 2, 1),
+            ] {
+                MoveToEx(dc, center - size, y - direction, null_mut());
+                LineTo(dc, center, y + direction * size);
+                LineTo(dc, center + size, y - direction);
+            }
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        }
+        if geometry.thumb_bottom > geometry.thumb_top {
+            let width = scale_for_dpi(if active { 6 } else { 3 }, UI_DPI)
+                .min((bounds.right - bounds.left).max(1));
+            let thumb = Rect {
+                left: center - width / 2,
+                right: center - width / 2 + width,
+                top: bounds.top + geometry.thumb_top,
+                bottom: bounds.top + geometry.thumb_bottom,
+            };
+            let color = if pressed {
+                theme::PAGE_SCROLL_THUMB_PRESSED
+            } else if active {
+                theme::PAGE_SCROLL_THUMB_HOVER
+            } else {
+                theme::PAGE_SCROLL_THUMB
+            };
+            rounded(dc, &thumb, if active { 6 } else { 3 }, color, color);
+        }
+        if focused {
+            bounds.left += 1;
+            bounds.top += 1;
+            bounds.right -= 1;
+            bounds.bottom -= 1;
+            focus_outline(dc, &bounds, 9, theme::FOCUS);
+        }
+    }
+    unsafe extern "system" fn page_scrollbar_proc(
+        bar: Handle,
+        message: u32,
+        w: usize,
+        l: isize,
+        _: usize,
+        _: usize,
+    ) -> isize {
+        // The native control supplies range, thumb tracking, keyboard behavior,
+        // and the accessibility object. Replace only its light-theme painting.
+        match message {
+            0xf => {
+                let mut paint: Paint = zeroed();
+                let dc = BeginPaint(bar, &mut paint);
+                paint_page_scrollbar(bar, dc);
+                EndPaint(bar, &paint);
+                return 0;
+            }
+            0x317 | 0x318 => {
+                paint_page_scrollbar(bar, w as Handle);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_TIMER if w == SCROLL_REVEAL_TIMER => {
+                if !SCROLL_REVEALED_UNTIL.is_some_and(|until| Instant::now() < until) {
+                    SCROLL_REVEALED_UNTIL = None;
+                    KillTimer(bar, SCROLL_REVEAL_TIMER);
+                    InvalidateRect(bar, null(), 0);
+                }
+                return 0;
+            }
+            0x200 if !SCROLL_HOVERED => {
+                SCROLL_HOVERED = true;
+                let mut tracking = TrackMouse {
+                    size: size_of::<TrackMouse>() as u32,
+                    flags: 2,
+                    hwnd: bar,
+                    hover_time: 0,
+                };
+                TrackMouseEvent(&mut tracking);
+                InvalidateRect(bar, null(), 0);
+            }
+            0x2a3 => {
+                SCROLL_HOVERED = false;
+                InvalidateRect(bar, null(), 0);
+            }
+            WM_DESTROY => {
+                KillTimer(bar, SCROLL_REVEAL_TIMER);
+                SCROLL_REVEALED_UNTIL = None;
+                SCROLL_HOVERED = false;
+            }
+            _ => {}
+        }
+        let result = DefSubclassProc(bar, message, w, l);
+        if matches!(message, 7 | 8 | 0x201 | 0x202 | 0x215) {
+            InvalidateRect(bar, null(), 0);
+        }
+        result
+    }
     // The fixed-size controls remain readable at the user's DPI; on short screens
     // the form scrolls instead of scaling text down or clipping the last actions.
     unsafe fn configure_scroll(h: Handle) {
-        let mut client = Rect {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
+        let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+        if bar == 0 {
+            return;
+        }
+        let mut client: Rect = zeroed();
         GetClientRect(h, &mut client);
+        let content = scale_for_dpi(content_height(h), UI_DPI);
+        let viewport = client.bottom.max(1);
         let info = ScrollInfo {
             size: size_of::<ScrollInfo>() as u32,
             mask: 0x1 | 0x2,
             min: 0,
-            max: scale_for_dpi(content_height(h), UI_DPI) - 1,
-            page: (client.bottom - client.top).max(1) as u32,
+            max: content - 1,
+            page: viewport as u32,
             position: 0,
             track_position: 0,
         };
-        SetScrollInfo(h, 1, &info, 1);
+        let width = if HIGH_CONTRAST {
+            GetSystemMetrics(2)
+        } else {
+            scale_for_dpi(16, UI_DPI)
+        };
+        let gutter = scale_for_dpi(2, UI_DPI);
+        let content_edge = scale_for_dpi(PANEL_WIDTH.x(736), UI_DPI);
+        let width = width.min((client.right - content_edge - 2 * gutter).max(1));
+        let margin = scale_for_dpi(12, UI_DPI).min(viewport / 4);
+        MoveWindow(
+            bar,
+            client.right - width - gutter,
+            margin,
+            width,
+            viewport - 2 * margin,
+            0,
+        );
+        SetScrollInfo(bar, SB_CTL, &info, 0);
+        if content > viewport {
+            ShowWindow(bar, 5);
+        } else {
+            if GetFocus() == bar {
+                let nav = if ACTIVE_PAGE == 2 {
+                    C_NAV_SETTINGS
+                } else {
+                    C_NAV_OVERVIEW
+                };
+                SetFocus(GetDlgItem(h, nav as i32));
+            }
+            SCROLL_HOVERED = false;
+            SCROLL_REVEALED_UNTIL = None;
+            KillTimer(bar, SCROLL_REVEAL_TIMER);
+            ShowWindow(bar, 0);
+        }
         // A larger viewport can clamp the scrollbar position; keep the child
         // controls and the painted cards aligned with that new position.
         scroll_to(h, SCROLL_OFFSET);
     }
     unsafe fn scroll_to(h: Handle, position: i32) {
+        let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+        if bar == 0 {
+            return;
+        }
         let info = ScrollInfo {
             size: size_of::<ScrollInfo>() as u32,
             mask: 0x4,
@@ -2604,10 +2926,24 @@ mod win {
             position,
             track_position: 0,
         };
-        let actual = SetScrollInfo(h, 1, &info, 1);
+        let actual = SetScrollInfo(bar, SB_CTL, &info, i32::from(HIGH_CONTRAST));
         if SCROLL_OFFSET != actual {
             SCROLL_OFFSET = actual;
             layout_controls(h);
+        }
+        InvalidateRect(bar, null(), 0);
+    }
+    unsafe fn scroll_from_input(h: Handle, position: i32) {
+        let before = SCROLL_OFFSET;
+        scroll_to(h, position);
+        if !HIGH_CONTRAST && SCROLL_OFFSET != before {
+            let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+            SCROLL_REVEALED_UNTIL =
+                Some(Instant::now() + Duration::from_millis(u64::from(SCROLL_REVEAL_MS)));
+            if SetTimer(bar, SCROLL_REVEAL_TIMER, SCROLL_REVEAL_MS, null()) == 0 {
+                SCROLL_REVEALED_UNTIL = None;
+            }
+            InvalidateRect(bar, null(), 0);
         }
     }
     unsafe fn ensure_focus_visible(h: Handle) {
@@ -2615,9 +2951,12 @@ mod win {
         if focus == 0 || GetParent(focus) != h {
             return;
         }
+        if GetDlgCtrlID(focus) as usize == C_PAGE_SCROLL {
+            return;
+        }
         if matches!(
             GetDlgCtrlID(focus) as usize,
-            C_NAV_OVERVIEW | C_NAV_SETTINGS | C_AUTHOR | C_ABOUT
+            C_NAV_OVERVIEW | C_NAV_SETTINGS | C_AUTHOR | C_UPDATE | C_ABOUT
         ) {
             return;
         }
@@ -2823,10 +3162,127 @@ mod win {
             }
         }
     }
+    unsafe fn draw_footer_icon(dc: Handle, bounds: &Rect, update: bool) {
+        let (tile, ink) = if update {
+            (theme::PRIMARY_SUBTLE, theme::PRIMARY)
+        } else {
+            (theme::NEUTRAL_HOVER, theme::TEXT_SECONDARY)
+        };
+        rounded(dc, bounds, 8, tile, tile);
+        let icon = scale_for_dpi(16, UI_DPI);
+        let left = (bounds.left + bounds.right - icon) / 2;
+        let top = (bounds.top + bounds.bottom - icon) / 2;
+        let x = |offset| left + scale_for_dpi(offset, UI_DPI);
+        let y = |offset| top + scale_for_dpi(offset, UI_DPI);
+        let pen = CreatePen(0, scale_for_dpi(2, UI_DPI), ink);
+        let old_pen = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, GetStockObject(5));
+        if update {
+            GdiArc(dc, x(2), y(2), x(15), y(15), x(13), y(4), x(15), y(10));
+            MoveToEx(dc, x(14), y(1), null_mut());
+            LineTo(dc, x(14), y(5));
+            LineTo(dc, x(10), y(5));
+        } else {
+            Ellipse(dc, x(5), y(2), x(11), y(8));
+            GdiArc(dc, x(2), y(9), x(14), y(20), x(14), y(14), x(2), y(14));
+        }
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+    }
+    unsafe fn draw_footer_card(item: &DrawItem, color: u32) {
+        let bounds = &item.rect;
+        let width = bounds.right - bounds.left;
+        let height = bounds.bottom - bounds.top;
+        let px = |dip| scale_for_dpi(dip, UI_DPI);
+        let split = height < px(28);
+        let stacked_text = height >= px(44);
+        let update = item.control_id as usize == C_UPDATE;
+        let state = app()
+            .and_then(|app| app.update_state.get())
+            .unwrap_or(UpdateState::Idle);
+        let (compact_title, detail) = update_caption(state);
+        let inset = px(if split { 3 } else { 10 });
+        let mut left = bounds.left + inset;
+        if !split && width >= px(if stacked_text { 128 } else { 116 }) {
+            let tile = px(if stacked_text { 28 } else { 22 });
+            let top = bounds.top + (height - tile) / 2;
+            draw_footer_icon(
+                item.dc,
+                &Rect {
+                    left,
+                    top,
+                    right: left + tile,
+                    bottom: top + tile,
+                },
+                update,
+            );
+            left += tile + px(8);
+        }
+        let right = bounds.right - inset;
+        let title = if update && stacked_text {
+            "检查更新"
+        } else if update && split && state == UpdateState::Current {
+            "已是最新"
+        } else if update {
+            compact_title
+        } else if split {
+            "作者"
+        } else {
+            "Liunian520"
+        };
+        let flags = 0x4 | 0x20 | 0x8000 | if split { 1 } else { 0 };
+        paint_label(
+            item.dc,
+            title,
+            Rect {
+                left,
+                top: bounds.top + if stacked_text { px(5) } else { 0 },
+                right,
+                bottom: if stacked_text {
+                    bounds.top + px(26)
+                } else {
+                    bounds.bottom
+                },
+            },
+            if stacked_text {
+                SECTION_FONT
+            } else {
+                SMALL_FONT
+            },
+            color,
+            flags,
+        );
+        if stacked_text {
+            let version;
+            let subtitle = if !update {
+                "GitHub 主页"
+            } else if detail.is_empty() {
+                version = format!("版本 v{}", application_version());
+                &version
+            } else {
+                detail
+            };
+            paint_label(
+                item.dc,
+                subtitle,
+                Rect {
+                    left,
+                    top: bounds.top + px(27),
+                    right,
+                    bottom: bounds.bottom - px(4),
+                },
+                SMALL_FONT,
+                theme::TEXT_TERTIARY,
+                flags,
+            );
+        }
+    }
     unsafe fn draw_button(item: &DrawItem) {
         let id = item.control_id as usize;
         let navigation = matches!(id, C_NAV_OVERVIEW | C_NAV_SETTINGS);
-        let footer = matches!(id, C_AUTHOR | C_ABOUT);
+        let card = matches!(id, C_AUTHOR | C_UPDATE);
+        let footer = card || id == C_ABOUT;
         let selected = (id == C_NAV_OVERVIEW && ACTIVE_PAGE == 1)
             || (id == C_NAV_SETTINGS && ACTIVE_PAGE == 2);
         let primary = matches!(id, C_SAVE | M_CHECK);
@@ -2845,6 +3301,14 @@ mod win {
         );
         let fill = if disabled {
             theme::DISABLED_SURFACE
+        } else if card {
+            if pressed {
+                theme::NEUTRAL_PRESSED
+            } else if hover {
+                theme::PRIMARY_SUBTLE
+            } else {
+                theme::SURFACE
+            }
         } else if navigation || footer {
             if pressed {
                 theme::NAV_PRESSED
@@ -2872,7 +3336,9 @@ mod win {
         } else {
             theme::SURFACE
         };
-        let border = if primary || navigation || footer || tertiary {
+        let border = if card {
+            theme::SURFACE_BORDER
+        } else if primary || navigation || footer || tertiary {
             fill
         } else {
             theme::CONTROL_BORDER
@@ -2882,14 +3348,8 @@ mod win {
             theme::DISABLED_TEXT
         } else if primary {
             theme::TEXT_ON_PRIMARY
-        } else if id == C_AUTHOR {
-            if pressed {
-                theme::PRIMARY_PRESSED
-            } else if hover {
-                theme::PRIMARY_HOVER
-            } else {
-                theme::PRIMARY
-            }
+        } else if card {
+            theme::TEXT_PRIMARY
         } else if id == C_ABOUT {
             if pressed {
                 theme::TEXT_SECONDARY
@@ -3000,54 +3460,17 @@ mod win {
             DeleteObject(pen);
             bounds.left += scale_for_dpi(48, UI_DPI);
         }
-        let mut buf = [0u16; 128];
-        let n = GetWindowTextW(item.item, buf.as_mut_ptr(), buf.len() as i32);
-        let native_label = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        let label = match id {
-            C_NAV_OVERVIEW => "连接概览",
-            C_NAV_SETTINGS => "认证设置",
-            _ => &native_label,
-        };
-        if id == C_AUTHOR {
-            let inset = scale_for_dpi(12, UI_DPI);
-            let compact = bounds.bottom - bounds.top < scale_for_dpi(40, UI_DPI);
-            paint_label(
-                item.dc,
-                "Liunian520",
-                Rect {
-                    left: bounds.left + inset,
-                    top: bounds.top + if compact { 0 } else { scale_for_dpi(5, UI_DPI) },
-                    right: bounds.right - inset,
-                    bottom: if compact {
-                        bounds.bottom
-                    } else {
-                        bounds.top + scale_for_dpi(25, UI_DPI)
-                    },
-                },
-                UI_FONT,
-                color,
-                0x4 | 0x20,
-            );
-            if !compact {
-                paint_label(
-                    item.dc,
-                    "作者 · GitHub 主页",
-                    Rect {
-                        left: bounds.left + inset,
-                        top: bounds.top + scale_for_dpi(27, UI_DPI),
-                        right: bounds.right - inset,
-                        bottom: bounds.bottom - scale_for_dpi(3, UI_DPI),
-                    },
-                    SMALL_FONT,
-                    if pressed {
-                        theme::TEXT_SECONDARY
-                    } else {
-                        theme::TEXT_TERTIARY
-                    },
-                    0x4 | 0x20,
-                );
-            }
+        if card {
+            draw_footer_card(item, color);
         } else {
+            let mut buf = [0u16; 128];
+            let n = GetWindowTextW(item.item, buf.as_mut_ptr(), buf.len() as i32);
+            let native_label = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            let label = match id {
+                C_NAV_OVERVIEW => "连接概览",
+                C_NAV_SETTINGS => "认证设置",
+                _ => &native_label,
+            };
             if footer {
                 bounds.left += scale_for_dpi(12, UI_DPI);
             }
@@ -3088,34 +3511,51 @@ mod win {
                 0
             }
             WM_VSCROLL => {
+                let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+                if bar == 0 || (l != 0 && l != bar) {
+                    return DefWindowProcW(h, m, w, l);
+                }
                 let mut info = ScrollInfo {
                     size: size_of::<ScrollInfo>() as u32,
-                    mask: 0x10,
+                    mask: 0x2 | 0x10,
                     min: 0,
                     max: 0,
                     page: 0,
                     position: 0,
                     track_position: 0,
                 };
-                GetScrollInfo(h, 1, &mut info);
+                GetScrollInfo(bar, SB_CTL, &mut info);
                 let line = scale_for_dpi(40, UI_DPI);
+                let page = (info.page as i32 - line).max(line);
                 let next = match w & 0xffff {
                     0 => SCROLL_OFFSET - line,
                     1 => SCROLL_OFFSET + line,
-                    2 => SCROLL_OFFSET - line * 4,
-                    3 => SCROLL_OFFSET + line * 4,
-                    4 | 5 => info.track_position,
+                    2 => SCROLL_OFFSET - page,
+                    3 => SCROLL_OFFSET + page,
+                    4 => (w >> 16) as u16 as i32,
+                    5 => info.track_position,
                     6 => 0,
                     7 => scale_for_dpi(content_height(h), UI_DPI),
                     _ => SCROLL_OFFSET,
                 };
-                scroll_to(h, next);
+                scroll_from_input(h, next);
                 0
             }
             WM_MOUSEWHEEL => {
                 let delta = ((w >> 16) as u16 as i16) as i32;
-                scroll_to(h, SCROLL_OFFSET - delta * scale_for_dpi(120, UI_DPI) / 120);
+                scroll_from_input(h, SCROLL_OFFSET - delta * scale_for_dpi(120, UI_DPI) / 120);
                 0
+            }
+            WM_SETTINGCHANGE => {
+                let always_visible = always_show_page_scrollbar();
+                if SCROLL_ALWAYS_VISIBLE != always_visible {
+                    SCROLL_ALWAYS_VISIBLE = always_visible;
+                    let bar = GetDlgItem(h, C_PAGE_SCROLL as i32);
+                    if bar != 0 {
+                        InvalidateRect(bar, null(), 0);
+                    }
+                }
+                DefWindowProcW(h, m, w, l)
             }
             WM_ERASEBKGND if !HIGH_CONTRAST => {
                 paint_background(h, w as Handle);
@@ -3130,6 +3570,7 @@ mod win {
                         | C_NAV_OVERVIEW
                         | C_NAV_SETTINGS
                         | C_AUTHOR
+                        | C_UPDATE
                         | C_ABOUT
                         | M_CHECK
                         | M_OPEN
@@ -3234,6 +3675,7 @@ mod win {
             WM_TIMER => {
                 if w == 1 {
                     refresh_status();
+                    refresh_update_card(h);
                 }
                 0
             }
@@ -3313,6 +3755,12 @@ mod win {
                             alert(h, "无法打开浏览器。作者主页：https://github.com/Liunian520");
                         }
                     }
+                    C_UPDATE if notification == 0 => {
+                        if let Some(app) = app() {
+                            (app.update.request)();
+                            refresh_update_card(h);
+                        }
+                    }
                     C_ABOUT => show_about(h),
                     C_SAVE => save_form(h),
                     C_DELETE => {
@@ -3366,6 +3814,7 @@ mod win {
         status: Arc<Mutex<String>>,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
+        update: UiUpdates,
     ) -> Result<(), String> {
         unsafe {
             SetProcessDPIAware();
@@ -3390,6 +3839,7 @@ mod win {
                 0,
             ) != 0
                 && contrast.flags & 1 != 0;
+            SCROLL_ALWAYS_VISIBLE = always_show_page_scrollbar();
             BACKGROUND_BRUSH = CreateSolidBrush(theme::BACKGROUND);
             HERO_BRUSH = CreateSolidBrush(theme::HERO);
             SIDEBAR_BRUSH = CreateSolidBrush(theme::SIDEBAR);
@@ -3436,7 +3886,7 @@ mod win {
             }
             let work_width = work_area.right - work_area.left;
             let work_height = work_area.bottom - work_area.top;
-            let window_style = 0x00ca0000 | 0x00200000;
+            let window_style = 0x00ca0000;
             let standard_width = scale_for_dpi(PanelWidth::STANDARD.width, UI_DPI);
             let mut frame = Rect {
                 left: 0,
@@ -3445,8 +3895,6 @@ mod win {
                 bottom: scale_for_dpi(CONTENT_HEIGHT, UI_DPI),
             };
             AdjustWindowRectEx(&mut frame, window_style, 0, 0);
-            // AdjustWindowRectEx excludes the vertical scrollbar's width.
-            frame.right += GetSystemMetrics(2);
             let chrome_width = frame.right - frame.left - standard_width;
             PANEL_WIDTH = PanelWidth::fit(work_width, chrome_width, UI_DPI);
             let window_width = scale_for_dpi(PANEL_WIDTH.width, UI_DPI) + chrome_width;
@@ -3507,20 +3955,31 @@ mod win {
                 "Liunian520\r\n作者 · GitHub 主页",
                 WS_TABSTOP | 0x2000 | button_style,
                 12,
-                488,
+                448,
                 144,
-                48,
+                52,
                 C_AUTHOR,
             );
             control(
                 h,
                 "BUTTON",
-                &format!("关于 · v{} · MIT", application_version()),
+                "检查更新",
+                WS_TABSTOP | 0x2000 | button_style,
+                12,
+                508,
+                144,
+                52,
+                C_UPDATE,
+            );
+            control(
+                h,
+                "BUTTON",
+                "关于 · MIT",
                 WS_TABSTOP | button_style,
                 12,
-                544,
+                568,
                 144,
-                32,
+                24,
                 C_ABOUT,
             );
             BUILD_PAGE = 1;
@@ -3845,6 +4304,28 @@ mod win {
             let first = initial.adapter_id.is_empty()
                 || initial.username.is_empty()
                 || !initial.http_acknowledged;
+            // Put the native scrollbar in the page gutter and last in Tab order.
+            let page_scrollbar = CreateWindowExW(
+                0,
+                wide("SCROLLBAR").as_ptr(),
+                wide("页面滚动").as_ptr(),
+                WS_CHILD | WS_TABSTOP | 1,
+                0,
+                0,
+                0,
+                0,
+                h,
+                C_PAGE_SCROLL as isize,
+                instance,
+                null(),
+            );
+            if page_scrollbar == 0 {
+                DestroyWindow(h);
+                return Err(error("创建页面滚动条失败"));
+            }
+            if !HIGH_CONTRAST {
+                SetWindowSubclass(page_scrollbar, Some(page_scrollbar_proc), 1, 0);
+            }
             let mut tray: Notify = zeroed();
             tray.size = size_of::<Notify>() as u32;
             tray.hwnd = h;
@@ -3874,6 +4355,8 @@ mod win {
                 tray_available: Cell::new(tray_available),
                 taskbar_created,
                 last_status: RefCell::new(String::new()),
+                update,
+                update_state: Cell::new(None),
                 generation,
                 gate,
             });
@@ -3886,6 +4369,7 @@ mod win {
             show_page(h, if first { 2 } else { 1 });
             SetTimer(h, 1, 1000, null());
             refresh_status();
+            refresh_update_card(h);
             if first || !tray_available || std::env::args().any(|arg| arg == "--show") {
                 open_panel(h, if first { 2 } else { 1 });
             }

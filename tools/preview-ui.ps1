@@ -24,6 +24,9 @@ param(
     [switch]$ClientOnly,
     [switch]$VerifyNavigation,
     [switch]$VerifyAuthor,
+    [switch]$VerifyUpdateCard,
+    [switch]$VerifyPageScrollbar,
+    [switch]$AlwaysShowPageScrollbar,
     [switch]$VerifyTrayActivation,
     [switch]$VerifyValidation,
     [switch]$LongAdapter,
@@ -55,6 +58,7 @@ $previewText = @'
 #![allow(dead_code, unused_imports)]
 #[path = "__UI_SOURCE__"] mod windows_ui;
 use std::sync::{atomic::AtomicU64, mpsc, Arc, Mutex};
+use std::{cell::Cell, rc::Rc, time::{Duration, Instant}};
 #[link(name = "user32")]
 extern "system" {
     fn EnumWindows(callback: unsafe extern "system" fn(isize, isize) -> i32, parameter: isize) -> i32;
@@ -97,6 +101,8 @@ fn main() {
     } else {
         "预览网卡 · WHUT-ISP / 网关 10.0.0.1".to_string()
     };
+    let requested = Rc::new(Cell::new(None::<Instant>));
+    let request_time = Rc::clone(&requested);
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
@@ -114,6 +120,14 @@ fn main() {
         }]),
         tx, Arc::new(Mutex::new(status)),
         Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(())),
+        windows_ui::UiUpdates {
+            request: Box::new(move || requested.set(Some(Instant::now()))),
+            status: Box::new(move || match request_time.get() {
+                None => windows_ui::UpdateState::Idle,
+                Some(start) if start.elapsed() < Duration::from_millis(1200) => windows_ui::UpdateState::Checking,
+                Some(_) => windows_ui::UpdateState::Current,
+            }),
+        },
     );
     if let Err(error) = result {
         std::fs::write(std::env::var_os("CAMPUS_PREVIEW_ERROR").unwrap_or_default(), error).ok();
@@ -227,7 +241,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         [GuardianPreviewNative]::PostMessage($Window, 0x28, $nav, [IntPtr]1) | Out-Null
         Start-Sleep -Milliseconds 100
         $ids = [Collections.Generic.List[int]]::new()
-        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,110,201,203) } else { @(301,302,303,304,101,135,102,103,104,105,106,107) }
+        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,305,306,110,201,203) } else { @(301,302,303,304,305,306,101,135,102,103,104,105,106,107) }
         for ($tab = 0; $tab -lt 20; $tab++) {
             $focus = [GuardianPreviewNative]::PreviewFocus($Window)
             if ($focus -eq [IntPtr]::Zero) { throw 'Preview does not expose background keyboard focus; no foreground activation was attempted.' }
@@ -300,7 +314,8 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         $scroll = [GuardianPreviewNative+ScrollInfo]::new()
         $scroll.Size = [Runtime.InteropServices.Marshal]::SizeOf($scroll)
         $scroll.Mask = 7
-        if (-not [GuardianPreviewNative]::GetScrollInfo($Window, 1, [ref]$scroll)) { throw 'Could not read the isolated short-screen scroll range.' }
+        $bar = [GuardianPreviewNative]::GetDlgItem($Window, 306)
+        if (-not [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll)) { throw 'Could not read the isolated short-screen scroll range.' }
         $expectedBottom = [Math]::Max($scroll.Min, $scroll.Max - [int]$scroll.Page + 1)
         # Manual scrolling must remain possible while a form field has focus.
         # This does not move the pointer, type, or activate the real desktop.
@@ -308,7 +323,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         Start-Sleep -Milliseconds 150
         $after = [GuardianPreviewNative+Rect]::new()
         [GuardianPreviewNative]::GetWindowRect($username, [ref]$after) | Out-Null
-        [GuardianPreviewNative]::GetScrollInfo($Window, 1, [ref]$scroll) | Out-Null
+        [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) | Out-Null
         $focusId = [GuardianPreviewNative]::GetDlgCtrlID([GuardianPreviewNative]::PreviewFocus($Window))
         if ($focusId -ne 102 -or $scroll.Position -ne $expectedBottom) {
             throw "Manual short-screen scroll snapped back to the focused field: focus=$focusId, scrollPosition=$($scroll.Position), requestedBottom=$expectedBottom, fieldTopBefore=$($before.Top), fieldTopAfter=$($after.Top)."
@@ -316,6 +331,85 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         $report.Add('Short-screen manual scrolling remains at the requested position while the username field retains focus.')
     }
     return $report
+}
+
+function Measure-PreviewScrollThumb([IntPtr]$Window, [IntPtr]$Bar, [string]$State) {
+    $parent = [GuardianPreviewNative+Rect]::new()
+    if ($ClientOnly) {
+        [GuardianPreviewNative]::GetClientRect($Window, [ref]$parent) | Out-Null
+        [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$parent, 2) | Out-Null
+    } else {
+        [GuardianPreviewNative]::GetWindowRect($Window, [ref]$parent) | Out-Null
+    }
+    $rail = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetWindowRect($Bar, [ref]$rail) | Out-Null
+    $capture = Join-Path $captureDir "settings-scrollbar-$State.png"
+    Save-PreviewWindow $Window $capture
+    $bitmap = [Drawing.Bitmap]::new($capture)
+    try {
+        $center = [int][Math]::Floor(($rail.Left + $rail.Right) / 2) - $parent.Left
+        $paintedPixels = 0
+        for ($y = $rail.Top - $parent.Top; $y -lt $rail.Bottom - $parent.Top; $y++) {
+            $pixel = $bitmap.GetPixel($center, $y)
+            if (($pixel.ToArgb() -band 0xffffff) -in 0x707780, 0x525e6b, 0x3d4956) { $paintedPixels++ }
+        }
+        return $paintedPixels
+    } finally {
+        $bitmap.Dispose()
+    }
+}
+
+function Test-PreviewPageScrollbar([IntPtr]$Window) {
+    $bar = [GuardianPreviewNative]::GetDlgItem($Window, 306)
+    $class = [Text.StringBuilder]::new(32)
+    [GuardianPreviewNative]::GetClassName($bar, $class, $class.Capacity) | Out-Null
+    if ($class.ToString() -ine 'ScrollBar' -or
+        ([GuardianPreviewNative]::GetWindowStyle($Window, -16).ToInt64() -band 0x200000) -ne 0) {
+        throw 'The form still uses a scrollbar on the outer window frame.'
+    }
+    $overview = [GuardianPreviewNative]::GetDlgItem($Window, 301)
+    $settings = [GuardianPreviewNative]::GetDlgItem($Window, 302)
+    [GuardianPreviewNative]::SendMessage($settings, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $scroll = [GuardianPreviewNative+ScrollInfo]::new()
+    $scroll.Size = [Runtime.InteropServices.Marshal]::SizeOf($scroll)
+    $scroll.Mask = 7
+    if (-not [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) -or
+        -not [GuardianPreviewNative]::IsWindowVisible($bar) -or $scroll.Max -lt $scroll.Page) {
+        throw 'A short settings page must expose the native scrollbar and a usable range.'
+    }
+    $restingPixels = Measure-PreviewScrollThumb $Window $bar 'idle'
+    if ($AlwaysShowPageScrollbar) {
+        if ($restingPixels -lt 10) { throw 'Always-show mode must retain a visible resting thumb.' }
+    } elseif ($restingPixels -ne 0) {
+        throw 'The scrollbar is still drawn while the overflowing settings page is idle.'
+    }
+    $bottom = $scroll.Max - [int]$scroll.Page + 1
+    [GuardianPreviewNative]::SendMessage($Window, 0x20a, [IntPtr](65416L -shl 16), [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) | Out-Null
+    if ($scroll.Position -le 0) { throw 'A downward mouse wheel event did not move the page scrollbar.' }
+    if ((Measure-PreviewScrollThumb $Window $bar 'scrolling') -lt 10) {
+        throw 'Wheel movement did not reveal the scrollbar thumb.'
+    }
+    if (-not $AlwaysShowPageScrollbar) {
+        Start-Sleep -Milliseconds 1200
+        if ((Measure-PreviewScrollThumb $Window $bar 'settled') -ne 0) {
+            throw 'The scrollbar did not clear after the wheel stopped.'
+        }
+    }
+    [GuardianPreviewNative]::SendMessage($bar, 0x100, [IntPtr]35, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) | Out-Null
+    if ($scroll.Position -ne $bottom) { throw 'End on the native scrollbar did not reveal the end of the page.' }
+    [GuardianPreviewNative]::SendMessage($bar, 0x101, [IntPtr]35, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::SendMessage($bar, 0x100, [IntPtr]36, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) | Out-Null
+    if ($scroll.Position -ne 0) { throw 'Home on the native scrollbar did not return to the top of the page.' }
+    [GuardianPreviewNative]::SendMessage($bar, 0x101, [IntPtr]36, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::SendMessage($overview, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::GetScrollInfo($bar, 2, [ref]$scroll) | Out-Null
+    if (($scroll.Max -lt $scroll.Page) -and [GuardianPreviewNative]::IsWindowVisible($bar)) {
+        throw 'The page scrollbar is still visible even though all overview content fits.'
+    }
+    'Native scrollbar respects its resting visibility, reveals on wheel, and preserves Home/End and overflow-only interaction.'
 }
 
 function Test-PreviewAuthor([IntPtr]$Window) {
@@ -327,8 +421,10 @@ function Test-PreviewAuthor([IntPtr]$Window) {
     [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$windowRect, 2) | Out-Null
     [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($Window, 302), [ref]$navigationRect) | Out-Null
     $priorBottom = $navigationRect.Bottom
+    $entries = [Collections.Generic.List[GuardianPreviewNative+Rect]]::new()
     foreach ($entry in @(
         @{ Id=303; Label='Liunian520'; Role='GitHub' },
+        @{ Id=305; Label='检查更新'; Role="v$($versionMatch.Groups[1].Value)" },
         @{ Id=304; Label='关于'; Role='MIT' }
     )) {
         $control = [GuardianPreviewNative]::GetDlgItem($Window, $entry.Id)
@@ -346,9 +442,35 @@ function Test-PreviewAuthor([IntPtr]$Window) {
             $rect.Right -gt $windowRect.Right -or $rect.Right -le $rect.Left) {
             throw "Author entry $($entry.Id) overlaps navigation or leaves the available window."
         }
-        $priorBottom = $rect.Bottom
+        foreach ($other in $entries) {
+            if ($rect.Left -lt $other.Right -and $other.Left -lt $rect.Right -and
+                $rect.Top -lt $other.Bottom -and $other.Top -lt $rect.Bottom) {
+                throw "Sidebar footer entry $($entry.Id) overlaps another footer entry."
+            }
+        }
+        $entries.Add($rect)
     }
-    'Author and About entries have clear native names, Tab support, and unobscured sidebar bounds; neither action was activated.'
+    'Author, update and About entries have clear native names, Tab support and unobscured sidebar bounds.'
+}
+
+function Test-PreviewUpdateCard([IntPtr]$Window) {
+    $control = [GuardianPreviewNative]::GetDlgItem($Window, 305)
+    if ($control -eq [IntPtr]::Zero -or -not [GuardianPreviewNative]::IsWindowVisible($control)) {
+        throw 'The update card is missing from the isolated preview.'
+    }
+    [GuardianPreviewNative]::SendMessage($control, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $checking = $false
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    while ($elapsed.ElapsedMilliseconds -lt 3500) {
+        $caption = [GuardianPreviewNative]::ReadControlText($control)
+        if ($caption.Contains('正在检查')) { $checking = $true }
+        if ($caption.Contains('已是最新版本')) {
+            if (-not $checking) { throw 'The update card skipped feedback while the check was running.' }
+            return 'Update card invokes the preview check and exposes checking and current status through its native button name.'
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    throw "The isolated update card did not display the completed check. Last caption: $caption"
 }
 
 function Test-PreviewTrayActivation([IntPtr]$Window) {
@@ -521,6 +643,7 @@ $previewProcess = $null
 $previewWindow = [IntPtr]::Zero
 $priorDpi = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI')
 $priorWidth = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH')
+$priorScrollMode = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE')
 $priorStatus = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_STATUS')
 $priorError = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_ERROR')
 $priorLongAdapter = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER')
@@ -530,6 +653,9 @@ $priorDpiContext = [GuardianPreviewNative]::SetThreadDpiAwarenessContext([IntPtr
 try {
     $env:CAMPUS_UI_PREVIEW_DPI = [string]$Dpi
     $env:CAMPUS_UI_PREVIEW_WORK_WIDTH = [string]$WorkAreaWidth
+    if ($VerifyPageScrollbar) {
+        $env:CAMPUS_UI_PREVIEW_SCROLL_MODE = if ($AlwaysShowPageScrollbar) { 'always' } else { 'auto' }
+    }
     $env:CAMPUS_PREVIEW_STATUS = $Status
     $env:CAMPUS_PREVIEW_ERROR = $errorPath
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $(if ($LongAdapter) { '1' } else { $null }))
@@ -604,6 +730,12 @@ try {
     if ($VerifyAuthor) {
         Test-PreviewAuthor $previewWindow | Write-Output
     }
+    if ($VerifyUpdateCard) {
+        Test-PreviewUpdateCard $previewWindow | Write-Output
+    }
+    if ($VerifyPageScrollbar) {
+        Test-PreviewPageScrollbar $previewWindow | Write-Output
+    }
     if ($UnbrokenAdapter) {
         Test-PreviewUnbrokenAdapter $previewWindow | Write-Output
     }
@@ -623,6 +755,7 @@ try {
 } finally {
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI', $priorDpi)
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH', $priorWidth)
+    [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE', $priorScrollMode)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_STATUS', $priorStatus)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_ERROR', $priorError)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $priorLongAdapter)

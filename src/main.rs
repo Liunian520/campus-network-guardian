@@ -931,8 +931,28 @@ fn main() {
             })
             .collect()
     });
-    update::start();
-    let _ = windows_ui::run(initial, adapters, tx, status, generation, gate);
+    let updates = update::start();
+    let update_status = updates.clone();
+    let _ = windows_ui::run(
+        initial,
+        adapters,
+        tx,
+        status,
+        generation,
+        gate,
+        windows_ui::UiUpdates {
+            request: Box::new(move || {
+                updates.request_check();
+            }),
+            status: Box::new(move || match update_status.status() {
+                update::UpdateStatus::Idle => windows_ui::UpdateState::Idle,
+                update::UpdateStatus::Checking => windows_ui::UpdateState::Checking,
+                update::UpdateStatus::Current => windows_ui::UpdateState::Current,
+                update::UpdateStatus::Installing => windows_ui::UpdateState::Installing,
+                update::UpdateStatus::Failed => windows_ui::UpdateState::Failed,
+            }),
+        },
+    );
     // Restore temporary routing as the UI exits, even when a portal GET is
     // still waiting on the worker. Taking the state prevents any later writes.
     let preference = routing.lock().unwrap_or_else(|err| err.into_inner()).take();

@@ -22,8 +22,8 @@ use windows_sys::{
         },
         System::Threading::{
             CreateEventW, CreateProcessWithTokenW, GetCurrentProcess, GetCurrentProcessId,
-            OpenProcess, OpenProcessToken, WaitForMultipleObjects, WaitForSingleObject,
-            CREATE_NO_WINDOW, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+            GetExitCodeProcess, OpenProcess, OpenProcessToken, WaitForMultipleObjects,
+            WaitForSingleObject, CREATE_NO_WINDOW, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
             PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
         },
         UI::WindowsAndMessaging::{
@@ -320,7 +320,14 @@ pub(super) fn launch_and_handoff(
     // Keep the parent's verified installer handle and stage alive during the
     // handoff. Normally this process exits before the wait completes.
     match unsafe { WaitForSingleObject(process.0, 30_000) } {
-        WAIT_OBJECT_0 => Ok(()),
+        WAIT_OBJECT_0 => {
+            let mut exit_code = 0;
+            check(unsafe { GetExitCodeProcess(process.0, &mut exit_code) })?;
+            if exit_code != 0 {
+                return Err(io::Error::other("silent release update failed"));
+            }
+            Ok(())
+        }
         WAIT_TIMEOUT => Err(io::ErrorKind::TimedOut.into()),
         _ => Err(io::Error::last_os_error()),
     }

@@ -8,6 +8,7 @@ use std::{
     os::windows::{ffi::OsStringExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -26,37 +27,101 @@ const INSTALLED_KEY: &str =
 const CHECK_PERIOD: Duration = Duration::from_secs(6 * 60 * 60);
 const RETRY_PERIOD: Duration = Duration::from_secs(30 * 60);
 
-pub fn start() {
-    if cfg!(test) {
-        return;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateStatus {
+    Idle,
+    Checking,
+    Current,
+    Installing,
+    Failed,
+}
+
+#[derive(Clone)]
+pub struct UpdateHandle {
+    request: mpsc::Sender<()>,
+    status: Arc<Mutex<UpdateStatus>>,
+}
+
+impl UpdateHandle {
+    pub fn request_check(&self) -> bool {
+        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(*status, UpdateStatus::Checking | UpdateStatus::Installing) {
+            return false;
+        }
+        if self.request.send(()).is_err() {
+            *status = UpdateStatus::Failed;
+            return false;
+        }
+        *status = UpdateStatus::Checking;
+        true
     }
+
+    pub fn status(&self) -> UpdateStatus {
+        *self.status.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+pub fn start() -> UpdateHandle {
     let delay = if std::env::args_os().any(|arg| arg == "--from-update") {
         CHECK_PERIOD
     } else {
         Duration::from_secs(20)
     };
-    let _ = thread::Builder::new()
-        .name("release-updater".into())
-        .spawn(move || {
-            thread::sleep(delay);
-            loop {
-                let delay = if check_once().is_ok() {
-                    CHECK_PERIOD
-                } else {
-                    RETRY_PERIOD
-                };
-                thread::sleep(delay);
-            }
-        });
+    spawn_worker(delay, |installing| {
+        if cfg!(test) {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        check_once(installing)
+    })
 }
 
-fn check_once() -> io::Result<()> {
+fn spawn_worker(
+    mut delay: Duration,
+    mut check: impl FnMut(&mut dyn FnMut()) -> io::Result<()> + Send + 'static,
+) -> UpdateHandle {
+    let (request, wake) = mpsc::channel();
+    let status = Arc::new(Mutex::new(UpdateStatus::Idle));
+    let worker_status = Arc::clone(&status);
+    let spawned = thread::Builder::new()
+        .name("release-updater".into())
+        .spawn(move || {
+            while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(delay) {
+                {
+                    let mut status = worker_status.lock().unwrap_or_else(|err| err.into_inner());
+                    // A click racing the scheduled timeout belongs to this check.
+                    // Drain it under the same lock used to publish a manual request.
+                    let _ = wake.try_recv();
+                    *status = UpdateStatus::Checking;
+                }
+                let success = check(&mut || {
+                    *worker_status.lock().unwrap_or_else(|err| err.into_inner()) =
+                        UpdateStatus::Installing;
+                })
+                .is_ok();
+                *worker_status.lock().unwrap_or_else(|err| err.into_inner()) = if success {
+                    UpdateStatus::Current
+                } else {
+                    UpdateStatus::Failed
+                };
+                delay = if success { CHECK_PERIOD } else { RETRY_PERIOD };
+            }
+        });
+    if spawned.is_err() {
+        *status.lock().unwrap_or_else(|err| err.into_inner()) = UpdateStatus::Failed;
+    }
+    UpdateHandle { request, status }
+}
+
+fn check_once(installing: &mut dyn FnMut()) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     if !executable
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case(EXECUTABLE))
     {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "updates require the standard Guardian executable name",
+        ));
     }
     let directory = executable.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let elevated = unsafe { IsUserAnAdmin() } != 0;
@@ -75,6 +140,7 @@ fn check_once() -> io::Result<()> {
     let mut locked = stage.lock_file()?;
     download::verify(&release, &mut locked)?;
     let args = installer_args(directory, portable);
+    installing();
     if elevated {
         let stage_name = stage
             .directory()
@@ -166,6 +232,55 @@ fn installer_args(directory: &Path, portable: bool) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::mpsc, time::Instant};
+
+    fn wait_for_status(handle: &UpdateHandle, expected: UpdateStatus) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while handle.status() != expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.status(), expected);
+    }
+
+    #[test]
+    fn manual_check_wakes_early_and_coalesces_clicks_through_installation() {
+        let (entered, checking) = mpsc::channel();
+        let (advance, proceed) = mpsc::channel();
+        let handle = spawn_worker(CHECK_PERIOD, move |installing| {
+            entered.send(()).unwrap();
+            proceed.recv().unwrap();
+            installing();
+            proceed.recv().unwrap();
+            Ok(())
+        });
+
+        assert_eq!(handle.status(), UpdateStatus::Idle);
+        assert!(handle.request_check());
+        checking.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(handle.status(), UpdateStatus::Checking);
+        assert!(!handle.request_check());
+        advance.send(()).unwrap();
+        wait_for_status(&handle, UpdateStatus::Installing);
+        assert!(!handle.request_check());
+        advance.send(()).unwrap();
+        wait_for_status(&handle, UpdateStatus::Current);
+        assert!(checking.recv_timeout(Duration::from_millis(30)).is_err());
+    }
+
+    #[test]
+    fn automatic_check_and_manual_retry_share_the_same_status() {
+        let mut first = true;
+        let handle = spawn_worker(Duration::ZERO, move |_| {
+            if std::mem::take(&mut first) {
+                Err(io::Error::other("simulated release check failed"))
+            } else {
+                Ok(())
+            }
+        });
+        wait_for_status(&handle, UpdateStatus::Failed);
+        assert!(handle.request_check());
+        wait_for_status(&handle, UpdateStatus::Current);
+    }
 
     #[test]
     fn installs_only_over_the_current_directory_and_preserves_tasks() {
