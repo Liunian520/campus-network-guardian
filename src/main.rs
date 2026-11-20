@@ -558,13 +558,20 @@ impl GuardedNetwork {
         generation: &Arc<AtomicU64>,
         gate: &Arc<Mutex<()>>,
     ) -> Result<(), CredentialsUnavailable> {
-        let connection = network::matched_connection(&self.identity).ok().flatten();
+        let state = network::inspect_connection(&self.identity)
+            .unwrap_or(network::ConnectionState::Unavailable);
+        let connection = state.connection();
         if connection != self.last_connection {
             self.network_changed(Instant::now());
             self.last_connection = connection;
         }
         let Some(connection) = connection else {
-            self.message = "校园网络不匹配或不可用，已暂停";
+            self.message = match state {
+                network::ConnectionState::DifferentEthernetAdapter => {
+                    "以太网网卡已变化，自动操作已暂停。请在设置中重新选择校园网网卡"
+                }
+                _ => "校园网络不匹配或不可用，已暂停",
+            };
             return Ok(());
         };
         let now = Instant::now();

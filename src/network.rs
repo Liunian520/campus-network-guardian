@@ -39,16 +39,56 @@ pub struct NetworkConnection {
     pub interface_index: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Ready(NetworkConnection),
+    DifferentEthernetAdapter,
+    Unavailable,
+}
+
+impl ConnectionState {
+    pub fn connection(self) -> Option<NetworkConnection> {
+        match self {
+            Self::Ready(connection) => Some(connection),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_connection(
+    expected: &NetworkIdentity,
+    adapters: &[Adapter],
+    route_matches: impl FnOnce(NetworkConnection, Ipv4Addr) -> io::Result<bool>,
+) -> io::Result<ConnectionState> {
+    if let Some(connection) = match_adapter(expected, adapters) {
+        return Ok(if route_matches(connection, expected.gateway)? {
+            ConnectionState::Ready(connection)
+        } else {
+            ConnectionState::Unavailable
+        });
+    }
+    // A matching gateway on another adapter is only a reason to prompt the
+    // user to reselect. It never authorizes sending credentials.
+    if expected.ssid.is_none()
+        && adapters.iter().any(|adapter| {
+            adapter.identity.ssid.is_none()
+                && adapter.identity.adapter_id != expected.adapter_id
+                && adapter.identity.gateway == expected.gateway
+        })
+    {
+        return Ok(ConnectionState::DifferentEthernetAdapter);
+    }
+    Ok(ConnectionState::Unavailable)
+}
+
+/// Verify the selected interface and distinguish a potentially replaced wired adapter.
+pub fn inspect_connection(expected: &NetworkIdentity) -> io::Result<ConnectionState> {
+    resolve_connection(expected, &list_adapters()?, platform::route_matches)
+}
+
 /// Verify identity and a route to the fixed campus portal through the selected interface.
 pub fn matched_connection(expected: &NetworkIdentity) -> io::Result<Option<NetworkConnection>> {
-    let Some(connection) = match_adapter(expected, &list_adapters()?) else {
-        return Ok(None);
-    };
-    if platform::route_matches(connection, expected.gateway)? {
-        Ok(Some(connection))
-    } else {
-        Ok(None)
-    }
+    Ok(inspect_connection(expected)?.connection())
 }
 
 pub fn matched_ipv4(expected: &NetworkIdentity) -> io::Result<Option<Ipv4Addr>> {
@@ -411,6 +451,27 @@ mod tests {
                 interface_index: 1
             })
         );
+    }
+
+    #[test]
+    fn same_gateway_on_another_ethernet_adapter_requires_reselection() {
+        let saved = adapter("original-ethernet", "10.0.0.1", None, "10.0.0.5");
+        let mut other = adapter("other-ethernet", "10.0.0.1", None, "10.0.0.7");
+        other.interface_index = 2;
+        let state = resolve_connection(&saved.identity, std::slice::from_ref(&other), |_, _| {
+            panic!("do not inspect the replacement's portal route")
+        })
+        .unwrap();
+        assert_eq!(state, ConnectionState::DifferentEthernetAdapter);
+        assert!(state.connection().is_none());
+
+        let state = resolve_connection(&saved.identity, &[other, saved.clone()], |route, _| {
+            assert_eq!(route.ipv4, saved.ipv4);
+            assert_eq!(route.interface_index, saved.interface_index);
+            Ok(true)
+        })
+        .unwrap();
+        assert!(state.connection().is_some());
     }
     #[test]
     fn refuses_changed_gateway_or_wireless_network() {

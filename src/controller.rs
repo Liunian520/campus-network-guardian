@@ -145,6 +145,9 @@ impl Controller {
                 }
                 self.defer(now, "请求结果未知，先观察门户状态");
             }
+            Err(PortalError::DiscoveryUnavailable) => {
+                self.defer(now, "校园认证入口暂不可达，将延迟重试");
+            }
             Err(PortalError::NetworkChanged) => {
                 if matches!(action, Action::Login | Action::Redial) {
                     self.uncertain_action = Some((action, now + Duration::from_secs(60)));

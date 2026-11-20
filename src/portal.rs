@@ -71,6 +71,7 @@ pub enum PortalError {
     Network,
     NetworkChanged,
     Unexpected,
+    DiscoveryUnavailable,
     ContextUnknown,
     ManualAction,
     Captcha,
@@ -218,9 +219,9 @@ impl PortalClient {
         if bytes.len() as u64 > MAX_RESPONSE {
             return Err(PortalError::Unexpected);
         }
-        // The peer may have applied a POST before dropping its response. Treat an
-        // empty response as transient so the controller can recheck status first.
-        if method == "POST" && bytes.is_empty() {
+        // A closed connection with no response is a transport failure. An
+        // empty POST reply may still follow a successful server-side action.
+        if (method == "POST" || allow_redirect) && bytes.is_empty() {
             return Err(PortalError::Network);
         }
         parse_http_inner(&bytes, allow_redirect)
@@ -240,7 +241,7 @@ impl PortalClient {
                     Err(error) => return Err(error),
                 }
             }
-            let first = first.ok_or(PortalError::ContextUnknown)?;
+            let first = first.ok_or(PortalError::DiscoveryUnavailable)?;
             let location = first
                 .location
                 .as_deref()
@@ -258,7 +259,8 @@ impl PortalClient {
             Ok(id.to_owned())
         };
         discover().map_err(|error| match error {
-            PortalError::NetworkChanged => error,
+            PortalError::Network => PortalError::DiscoveryUnavailable,
+            PortalError::NetworkChanged | PortalError::DiscoveryUnavailable => error,
             _ => PortalError::ContextUnknown,
         })
     }
@@ -320,13 +322,7 @@ impl PortalClient {
             return Err(PortalError::ManualAction);
         }
         self.verify()?;
-        let nas_id = self.discover_nas_id().map_err(|e| {
-            if e == PortalError::Unexpected {
-                PortalError::ContextUnknown
-            } else {
-                e
-            }
-        })?;
+        let nas_id = self.discover_nas_id()?;
         let mut headers = self.session()?;
         headers.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
         // Reserve the encoded maximum up front so reallocations do not leave copies
@@ -395,13 +391,13 @@ fn resolve_probe_addresses() -> Result<Vec<SocketAddrV4>, PortalError> {
             });
             let _ = sender.send(addresses);
         })
-        .map_err(|_| PortalError::ContextUnknown)?;
+        .map_err(|_| PortalError::DiscoveryUnavailable)?;
     let addresses = receiver
         .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| PortalError::ContextUnknown)?
-        .map_err(|_| PortalError::ContextUnknown)?;
+        .map_err(|_| PortalError::DiscoveryUnavailable)?
+        .map_err(|_| PortalError::DiscoveryUnavailable)?;
     if addresses.is_empty() {
-        Err(PortalError::ContextUnknown)
+        Err(PortalError::DiscoveryUnavailable)
     } else {
         Ok(addresses)
     }
@@ -1163,6 +1159,38 @@ mod transport_tests {
             .unwrap()
             .iter()
             .all(|request| request.starts_with("GET ")));
+    }
+
+    #[test]
+    fn interrupted_nas_discovery_backs_off_and_allows_another_login_attempt() {
+        use crate::controller::{Action, Controller};
+        use std::time::Instant;
+
+        let page: &'static str =
+            Box::leak(ok("/account/status /account/redial /account/check").into_boxed_str());
+        let first = "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/14?userip=127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+        for responses in [vec![page, ""], vec![page, first, ""]] {
+            let (client, task) = serve(responses);
+            let result = client.login("fake-user", "fake-password").map(Some);
+            assert!(result.is_err());
+            assert!(task.join().unwrap().iter().all(|r| r.starts_with("GET ")));
+
+            let mut now = Instant::now();
+            let mut controller = Controller::new(now);
+            for seconds in [15, 30, 60, 120, 300, 300] {
+                let action = controller.on_status(now, Ok(PortalStatus::Offline));
+                assert_eq!(action, Action::Login);
+                controller.on_action_result(now, action, result);
+                let next = now + Duration::from_secs(seconds);
+                assert_eq!(controller.next(), next);
+                controller.check_now(now);
+                assert_eq!(
+                    controller.on_status(now, Ok(PortalStatus::Offline)),
+                    Action::None
+                );
+                now = next;
+            }
+        }
     }
 
     #[test]
