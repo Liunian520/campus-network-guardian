@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod analytics;
 mod update;
 mod windows_ui;
+mod winhttp;
 
 use campus_network_guardian::{
     controller::{Action, Controller},
@@ -934,6 +936,8 @@ fn main() {
     let updates = update::start();
     let update_status = updates.clone();
     let update_info = updates.clone();
+    let analytics = analytics::start();
+    let analytics_status = analytics.clone();
     let _ = windows_ui::run(
         initial,
         adapters,
@@ -961,6 +965,10 @@ fn main() {
                     progress: info.progress,
                 }
             }),
+        },
+        windows_ui::UiAnalytics {
+            enabled: Box::new(move || analytics_status.enabled()),
+            set_enabled: Box::new(move |enabled| analytics.set_enabled(enabled)),
         },
     );
     // Restore temporary routing as the UI exits, even when a portal GET is

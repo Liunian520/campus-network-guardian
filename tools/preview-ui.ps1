@@ -30,6 +30,7 @@ param(
     [switch]$AlwaysShowPageScrollbar,
     [switch]$VerifyTrayActivation,
     [switch]$VerifyValidation,
+    [switch]$VerifyAnalytics,
     [switch]$LongAdapter,
     [switch]$UnbrokenAdapter,
     [switch]$DiagnoseStatus
@@ -105,6 +106,8 @@ fn main() {
     let requested = Rc::new(Cell::new(None::<Instant>));
     let request_time = Rc::clone(&requested);
     let info_time = Rc::clone(&requested);
+    let analytics_enabled = Rc::new(Cell::new(false));
+    let analytics_preference = Rc::clone(&analytics_enabled);
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
@@ -138,6 +141,13 @@ fn main() {
                     Some(start) if start.elapsed() < Duration::from_millis(1200) => "正在检查更新",
                     Some(_) => "更新检查已完成",
                 }.into(),
+            }),
+        },
+        windows_ui::UiAnalytics {
+            enabled: Box::new(move || analytics_preference.get()),
+            set_enabled: Box::new(move |enabled| {
+                analytics_enabled.set(enabled);
+                Ok(())
             }),
         },
     );
@@ -266,7 +276,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         [GuardianPreviewNative]::PostMessage($Window, 0x28, $nav, [IntPtr]1) | Out-Null
         Start-Sleep -Milliseconds 100
         $ids = [Collections.Generic.List[int]]::new()
-        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,305,306,110,201,203) } else { @(301,302,303,304,305,306,101,135,102,103,104,105,106,107) }
+        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,305,306,110,201,203) } else { @(301,302,303,304,305,306,101,135,102,103,104,105,106,107,138) }
         for ($tab = 0; $tab -lt 20; $tab++) {
             $focus = [GuardianPreviewNative]::PreviewFocus($Window)
             if ($focus -eq [IntPtr]::Zero) { throw 'Preview does not expose background keyboard focus; no foreground activation was attempted.' }
@@ -768,6 +778,68 @@ function Test-PreviewValidation([IntPtr]$Window) {
     return $report
 }
 
+function Test-PreviewAnalytics([IntPtr]$Window) {
+    $settingsNav = [GuardianPreviewNative]::GetDlgItem($Window, 302)
+    $overviewNav = [GuardianPreviewNative]::GetDlgItem($Window, 301)
+    $analytics = [GuardianPreviewNative]::GetDlgItem($Window, 138)
+    $disclosure = [GuardianPreviewNative]::GetDlgItem($Window, 139)
+    if ($analytics -eq [IntPtr]::Zero -or $disclosure -eq [IntPtr]::Zero) {
+        throw 'The settings page needs an analytics consent control and disclosure.'
+    }
+    $username = [GuardianPreviewNative]::GetDlgItem($Window, 102)
+    $httpConsent = [GuardianPreviewNative]::GetDlgItem($Window, 104)
+    [GuardianPreviewNative]::SendMessage($settingsNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    if ([GuardianPreviewNative]::SendMessage($analytics, 0xf0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 0) {
+        throw 'Analytics consent must start unchecked.'
+    }
+    $text = [GuardianPreviewNative]::ReadControlText($disclosure)
+    if ($text -notmatch '每天最多.*一次' -or $text -notmatch '随机安装标识' -or
+        $text -notmatch '版本' -or $text -notmatch '清除.*标识') {
+        throw "Analytics disclosure is incomplete: $text"
+    }
+    [GuardianPreviewNative]::SetControlText($username, 'demo-consent-draft') | Out-Null
+    [GuardianPreviewNative]::SendMessage($httpConsent, 0xf1, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    foreach ($consentState in @(1, 0)) {
+        [GuardianPreviewNative]::SendMessage($analytics, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        [GuardianPreviewNative]::SendMessage($analytics, 0xf1, [IntPtr](1 - $consentState), [IntPtr]::Zero) | Out-Null
+        [GuardianPreviewNative]::SendMessage($overviewNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        [GuardianPreviewNative]::SendMessage($settingsNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        if ([GuardianPreviewNative]::SendMessage($analytics, 0xf0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne $consentState) {
+            throw "Analytics consent did not apply independently with state $consentState."
+        }
+    }
+    if ((Read-PreviewControl $Window 102) -ne 'demo-consent-draft' -or
+        [GuardianPreviewNative]::SendMessage($httpConsent, 0xf0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 0) {
+        throw 'Analytics consent changed the unsaved authentication form.'
+    }
+    [GuardianPreviewNative]::SetControlText($username, 'demo-campus') | Out-Null
+    [GuardianPreviewNative]::SendMessage($httpConsent, 0xf1, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+
+    # Exercise the tray command off screen without foreground activation.
+    [GuardianPreviewNative]::SendMessage($overviewNav, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::EnableWindow($Window, $false) | Out-Null
+    try {
+        [GuardianPreviewNative]::SendMessage($Window, 0x111, [IntPtr]206, [IntPtr]::Zero) | Out-Null
+    } finally {
+        [GuardianPreviewNative]::EnableWindow($Window, $true) | Out-Null
+    }
+    $client = [GuardianPreviewNative+Rect]::new()
+    $checkBounds = [GuardianPreviewNative+Rect]::new()
+    $disclosureBounds = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetClientRect($Window, [ref]$client) | Out-Null
+    [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$client, 2) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($analytics, [ref]$checkBounds) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($disclosure, [ref]$disclosureBounds) | Out-Null
+    if (-not [GuardianPreviewNative]::IsWindowVisible($analytics) -or
+        $checkBounds.Top -lt $client.Top -or $disclosureBounds.Bottom -gt $client.Bottom) {
+        throw 'The tray command did not bring the analytics controls and disclosure into view.'
+    }
+    if ([GuardianPreviewNative]::SendMessage($analytics, 0xf0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 0) {
+        throw 'Opening the analytics setting from the tray granted consent.'
+    }
+    'Analytics starts off, can be enabled and disabled independently, and opens from the tray without granting consent.'
+}
+
 function Save-PreviewWindow([IntPtr]$Window, [string]$Destination) {
     $rect = [GuardianPreviewNative+Rect]::new()
     $gotRect = if ($ClientOnly) { [GuardianPreviewNative]::GetClientRect($Window, [ref]$rect) } else { [GuardianPreviewNative]::GetWindowRect($Window, [ref]$rect) }
@@ -904,6 +976,12 @@ try {
         $validationCapture = Join-Path $captureDir ("settings-validation-$Dpi.png")
         Save-PreviewWindow $previewWindow $validationCapture
         Write-Output $validationCapture
+    }
+    if ($VerifyAnalytics) {
+        Test-PreviewAnalytics $previewWindow | Write-Output
+        $analyticsCapture = Join-Path $captureDir ("settings-analytics-$Dpi.png")
+        Save-PreviewWindow $previewWindow $analyticsCapture
+        Write-Output $analyticsCapture
     }
     if ($DiagnoseStatus) {
         Get-PreviewStatusDiagnostics $previewWindow | Write-Output

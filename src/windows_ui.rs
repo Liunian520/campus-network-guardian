@@ -635,13 +635,18 @@ pub struct UpdateInfo {
 #[cfg(windows)]
 const APPLICATION_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(version) => version,
-    None => "0.6.8",
+    None => "0.6.9",
 };
 
 pub struct UiUpdates {
     pub request: Box<dyn Fn()>,
     pub status: Box<dyn Fn() -> UpdateState>,
     pub info: Box<dyn Fn() -> UpdateInfo>,
+}
+
+pub struct UiAnalytics {
+    pub enabled: Box<dyn Fn() -> bool>,
+    pub set_enabled: Box<dyn Fn(bool) -> Result<(), String>>,
 }
 
 const DISCONNECTED_LABEL: &str = "（当前未连接）";
@@ -755,7 +760,7 @@ mod win {
         adapter_options, autostart_value_matches, connection_heading, copy_utf16,
         matches_terminated_username, notify_network_change, notify_quit, overview_network_text,
         scale_for_dpi, settings_allowed, settings_failure_message, settings_transaction,
-        should_notify, Adapter, Event, PanelWidth, Settings, UiUpdates, UpdateState,
+        should_notify, Adapter, Event, PanelWidth, Settings, UiAnalytics, UiUpdates, UpdateState,
     };
     use super::{tray_action, TrayAction, TRAY_ICON_ID, WM_LBUTTONDBLCLK};
     use std::{
@@ -838,6 +843,8 @@ mod win {
     const C_SECONDARY_ADAPTER: usize = 135;
     const C_LABEL_ADAPTER: usize = 136;
     const C_LABEL_SECONDARY_ADAPTER: usize = 137;
+    const C_ANALYTICS: usize = 138;
+    const C_ANALYTICS_DISCLOSURE: usize = 139;
     const C_NAV_OVERVIEW: usize = 301;
     const C_NAV_SETTINGS: usize = 302;
     const C_AUTHOR: usize = 303;
@@ -849,6 +856,9 @@ mod win {
     const M_OPEN: usize = 203;
     const M_QUIT: usize = 204;
     const M_TRAY_PANEL: usize = 205;
+    const M_ANALYTICS: usize = 206;
+    const BM_GETCHECK: u32 = 0xf0;
+    const BM_SETCHECK: u32 = 0xf1;
     const WS_CHILD: u32 = 0x40000000;
     const WS_VISIBLE: u32 = 0x10000000;
     const WS_TABSTOP: u32 = 0x10000;
@@ -861,6 +871,9 @@ mod win {
     const COMPACT_OVERVIEW_SHIFT: i32 = 32;
     const NETWORK_FIELD_ROW_HEIGHT: i32 = 24;
     const ADAPTER_COMBO_WIDTH: i32 = 220;
+    const ANALYTICS_TOP: i32 = 596;
+    const ANALYTICS_DISCLOSURE_TOP: i32 = 646;
+    const ANALYTICS_DISCLOSURE: &str = "允许后，每天最多发送一次应用活跃事件，包含随机安装标识和应用版本。事件不包含姓名、校园网账号、密码、网卡或 Wi-Fi 信息。取消勾选会停止新上报并清除本机安装标识。已经发送的请求可能完成。";
     const HKEY_CURRENT_USER: Handle = 0x80000001u32 as i32 as isize;
     #[repr(C)]
     struct Point {
@@ -1547,6 +1560,7 @@ mod win {
         last_status: RefCell<String>,
         update: UiUpdates,
         update_state: Cell<Option<UpdateState>>,
+        analytics: UiAnalytics,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
     }
@@ -1604,6 +1618,7 @@ mod win {
         http_hint: i32,
         startup: i32,
         automation: i32,
+        analytics: i32,
     }
     static mut FORM_WRAP: FormWrap = FormWrap {
         account: 0,
@@ -1611,6 +1626,7 @@ mod win {
         http_hint: 0,
         startup: 0,
         automation: 0,
+        analytics: 0,
     };
     unsafe fn app() -> Option<&'static App> {
         APP.as_ref()
@@ -1696,6 +1712,23 @@ mod win {
             0x40,
         );
     }
+    unsafe fn refresh_analytics_consent(h: Handle, app: &App) {
+        SendMessageW(
+            GetDlgItem(h, C_ANALYTICS as i32),
+            BM_SETCHECK,
+            usize::from((app.analytics.enabled)()),
+            0,
+        );
+    }
+    unsafe fn change_analytics_consent(h: Handle) {
+        let Some(app) = app() else { return };
+        let checked = SendMessageW(GetDlgItem(h, C_ANALYTICS as i32), BM_GETCHECK, 0, 0) == 1;
+        let result = (app.analytics.set_enabled)(checked);
+        refresh_analytics_consent(h, app);
+        if let Err(error) = result {
+            alert(h, &format!("无法保存匿名使用统计设置。\r\n{error}"));
+        }
+    }
     unsafe fn make_font(height: i32, weight: i32) -> Handle {
         CreateFontW(
             -scale_for_dpi(height, UI_DPI),
@@ -1772,6 +1805,7 @@ mod win {
                     | C_HTTP_HINT
                     | C_FORM_FEEDBACK
                     | C_ADAPTER_DETAIL
+                    | C_ANALYTICS_DISCLOSURE
                     | C_ABOUT
             ) {
                 SMALL_FONT
@@ -2105,18 +2139,27 @@ mod win {
         let http = measured_height(h, &text(h, C_HTTP_HINT), SMALL_FONT, 482).max(20);
         let startup = measured_height(h, &text(h, C_START), UI_FONT, 472).max(22);
         let startup_hint = measured_height(h, &text(h, C_START_HINT), SMALL_FONT, 482).max(18);
+        let analytics = measured_height(h, ANALYTICS_DISCLOSURE, SMALL_FONT, 482);
         FORM_WRAP = FormWrap {
             account: password - 20,
             consent: consent - 22,
             http_hint: http - 20,
             startup: startup - 22,
             automation: (consent - 22) + (http - 20) + (startup - 22) + (startup_hint - 18),
+            analytics,
         };
         set_control_bounds(C_HINT_PASSWORD, 212, 320, 504, password);
         set_control_bounds(C_CONSENT, 212, 414, 504, consent);
         set_control_bounds(C_HTTP_HINT, 234, 440, 482, http);
         set_control_bounds(C_START, 212, 472, 504, startup);
         set_control_bounds(C_START_HINT, 234, 496, 482, startup_hint);
+        set_control_bounds(
+            C_ANALYTICS_DISCLOSURE,
+            234,
+            ANALYTICS_DISCLOSURE_TOP,
+            482,
+            analytics,
+        );
     }
     unsafe fn form_feedback(h: Handle, message: &str, field: usize) {
         FORM_ERROR_FIELD = if message.is_empty() { 0 } else { field };
@@ -2163,16 +2206,18 @@ mod win {
     }
     unsafe fn content_height(h: Handle) -> i32 {
         if ACTIVE_PAGE == 2 {
-            CONTENT_HEIGHT
-                + FORM_SHIFT
-                + FORM_NETWORK_EXTRA
-                + FORM_WRAP.account
-                + FORM_WRAP.automation
+            ANALYTICS_TOP + analytics_card_height() + 24 + settings_analytics_shift()
         } else if viewport_height(h) < COMPACT_OVERVIEW_HEIGHT {
             OVERVIEW_HEIGHT - COMPACT_OVERVIEW_SHIFT
         } else {
             OVERVIEW_HEIGHT
         }
+    }
+    unsafe fn analytics_card_height() -> i32 {
+        ANALYTICS_DISCLOSURE_TOP - ANALYTICS_TOP + FORM_WRAP.analytics + 16
+    }
+    unsafe fn settings_analytics_shift() -> i32 {
+        form_feedback_shift(ANALYTICS_TOP) + preceding_form_expansion(ANALYTICS_TOP)
     }
     const SIDEBAR_CARD_MIN_HEIGHT: i32 = 368;
     unsafe fn layout_controls(h: Handle) {
@@ -2256,7 +2301,9 @@ mod win {
                         C_HTTP_HINT => FORM_WRAP.consent,
                         C_START => FORM_WRAP.consent + FORM_WRAP.http_hint,
                         C_START_HINT => FORM_WRAP.consent + FORM_WRAP.http_hint + FORM_WRAP.startup,
-                        C_SAVE | C_DELETE => FORM_WRAP.automation,
+                        C_SAVE | C_DELETE | C_ANALYTICS | C_ANALYTICS_DISCLOSURE => {
+                            FORM_WRAP.automation
+                        }
                         _ => 0,
                     };
                 }
@@ -2321,6 +2368,9 @@ mod win {
         );
         if page == 2 {
             refresh_adapters(h);
+            if let Some(app) = app() {
+                refresh_analytics_consent(h, app);
+            }
         } else {
             update_overview(h);
         }
@@ -2664,6 +2714,12 @@ mod win {
             AppendMenuW(m, 0, M_TRAY_PANEL, wide(&panel_label).as_ptr());
             AppendMenuW(m, 0, M_CHECK, wide("立即检查").as_ptr());
             AppendMenuW(m, 0, M_SETTINGS, wide("设置").as_ptr());
+            let analytics_label = if (app.analytics.enabled)() {
+                "匿名使用统计 · 已开启"
+            } else {
+                "匿名使用统计 · 已关闭"
+            };
+            AppendMenuW(m, 0, M_ANALYTICS, wide(analytics_label).as_ptr());
             AppendMenuW(m, 0, M_OPEN, wide("认证页面").as_ptr());
             AppendMenuW(m, 0, M_QUIT, wide("退出").as_ptr());
             let right_aligned = GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0;
@@ -3015,9 +3071,17 @@ mod win {
         }
         MapWindowPoints(0, h, (&mut control as *mut Rect).cast(), 2);
         let margin = scale_for_dpi(8, UI_DPI);
-        if ACTIVE_PAGE == 2 && FORM_SHIFT > 0 && GetDlgCtrlID(focus) as usize == FORM_ERROR_FIELD {
+        let focus_id = GetDlgCtrlID(focus) as usize;
+        let companion = if focus_id == C_ANALYTICS {
+            C_ANALYTICS_DISCLOSURE
+        } else if ACTIVE_PAGE == 2 && FORM_SHIFT > 0 && focus_id == FORM_ERROR_FIELD {
+            C_FORM_FEEDBACK
+        } else {
+            0
+        };
+        if companion != 0 {
             let mut feedback: Rect = zeroed();
-            if GetWindowRect(GetDlgItem(h, C_FORM_FEEDBACK as i32), &mut feedback) != 0 {
+            if GetWindowRect(GetDlgItem(h, companion as i32), &mut feedback) != 0 {
                 MapWindowPoints(0, h, (&mut feedback as *mut Rect).cast(), 2);
                 let top = control.top.min(feedback.top);
                 let bottom = control.bottom.max(feedback.bottom);
@@ -3174,6 +3238,19 @@ mod win {
                     theme::SURFACE_BORDER,
                 );
             }
+            rounded(
+                dc,
+                &dip_rect(
+                    192,
+                    ANALYTICS_TOP + settings_analytics_shift(),
+                    544,
+                    analytics_card_height(),
+                    true,
+                ),
+                12,
+                theme::SURFACE,
+                theme::SURFACE_BORDER,
+            );
             for (id, x, y, width) in [
                 (C_USER, 212, 272, 240),
                 (C_PASS, 476, 272, 240),
@@ -3635,6 +3712,7 @@ mod win {
                         | C_NETWORK_LABEL
                         | C_HTTP_HINT
                         | C_ADAPTER_DETAIL
+                        | C_ANALYTICS_DISCLOSURE
                 );
                 let on_background = matches!(
                     id,
@@ -3805,6 +3883,7 @@ mod win {
                         );
                     }
                     C_ABOUT => show_about(h),
+                    C_ANALYTICS if notification == 0 => change_analytics_consent(h),
                     C_SAVE => save_form(h),
                     C_DELETE => {
                         let Some(app) = app() else {
@@ -3829,6 +3908,11 @@ mod win {
                     }
                     M_SETTINGS => {
                         open_panel(h, 2);
+                    }
+                    M_ANALYTICS => {
+                        open_panel(h, 2);
+                        scroll_to(h, i32::MAX);
+                        SetFocus(GetDlgItem(h, C_ANALYTICS as i32));
                     }
                     M_OPEN => {
                         ShellExecuteW(
@@ -3858,6 +3942,7 @@ mod win {
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
         update: UiUpdates,
+        analytics: UiAnalytics,
     ) -> Result<(), String> {
         unsafe {
             SetProcessDPIAware();
@@ -4342,6 +4427,28 @@ mod win {
                 40,
                 C_DELETE,
             );
+            control(
+                h,
+                "BUTTON",
+                "允许发送匿名使用统计",
+                WS_TABSTOP | 3 | 0x2000,
+                212,
+                ANALYTICS_TOP + 16,
+                504,
+                28,
+                C_ANALYTICS,
+            );
+            control(
+                h,
+                "STATIC",
+                ANALYTICS_DISCLOSURE,
+                0,
+                234,
+                ANALYTICS_DISCLOSURE_TOP,
+                482,
+                0,
+                C_ANALYTICS_DISCLOSURE,
+            );
             BUILD_PAGE = 0;
             measure_form_text(h);
             let first = initial.adapter_id.is_empty()
@@ -4400,6 +4507,7 @@ mod win {
                 last_status: RefCell::new(String::new()),
                 update,
                 update_state: Cell::new(None),
+                analytics,
                 generation,
                 gate,
             });
