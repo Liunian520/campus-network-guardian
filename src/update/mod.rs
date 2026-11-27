@@ -1,3 +1,4 @@
+mod archive;
 mod download;
 mod handoff;
 mod stage;
@@ -36,10 +37,26 @@ pub enum UpdateStatus {
     Failed,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub source: String,
+    pub changelog: String,
+    pub progress: String,
+}
+
+enum CheckEvent {
+    Announcement(UpdateInfo),
+    SelectedSource { version: String, source: String },
+    Progress(&'static str),
+    Installing,
+}
+
 #[derive(Clone)]
 pub struct UpdateHandle {
     request: mpsc::Sender<()>,
     status: Arc<Mutex<UpdateStatus>>,
+    info: Arc<Mutex<UpdateInfo>>,
 }
 
 impl UpdateHandle {
@@ -50,14 +67,29 @@ impl UpdateHandle {
         }
         if self.request.send(()).is_err() {
             *status = UpdateStatus::Failed;
+            self.info
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .progress = "更新检查暂不可用".into();
             return false;
         }
         *status = UpdateStatus::Checking;
+        self.info
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .progress = "正在检查更新".into();
         true
     }
 
     pub fn status(&self) -> UpdateStatus {
         *self.status.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    pub fn info(&self) -> UpdateInfo {
+        self.info
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 }
 
@@ -67,21 +99,23 @@ pub fn start() -> UpdateHandle {
     } else {
         Duration::from_secs(20)
     };
-    spawn_worker(delay, |installing| {
+    spawn_worker(delay, |publish| {
         if cfg!(test) {
             return Err(io::ErrorKind::Unsupported.into());
         }
-        check_once(installing)
+        check_once(publish)
     })
 }
 
 fn spawn_worker(
     mut delay: Duration,
-    mut check: impl FnMut(&mut dyn FnMut()) -> io::Result<()> + Send + 'static,
+    mut check: impl FnMut(&mut dyn FnMut(CheckEvent)) -> io::Result<()> + Send + 'static,
 ) -> UpdateHandle {
     let (request, wake) = mpsc::channel();
     let status = Arc::new(Mutex::new(UpdateStatus::Idle));
+    let info = Arc::new(Mutex::new(UpdateInfo::default()));
     let worker_status = Arc::clone(&status);
+    let worker_info = Arc::clone(&info);
     let spawned = thread::Builder::new()
         .name("release-updater".into())
         .spawn(move || {
@@ -92,27 +126,74 @@ fn spawn_worker(
                     // Drain it under the same lock used to publish a manual request.
                     let _ = wake.try_recv();
                     *status = UpdateStatus::Checking;
+                    worker_info
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .progress = "正在检查更新".into();
                 }
-                let success = check(&mut || {
-                    *worker_status.lock().unwrap_or_else(|err| err.into_inner()) =
-                        UpdateStatus::Installing;
+                let success = check(&mut |event| match event {
+                    CheckEvent::Announcement(details) => {
+                        let mut info = worker_info.lock().unwrap_or_else(|err| err.into_inner());
+                        if info.version != details.version || !details.changelog.trim().is_empty() {
+                            info.changelog = details.changelog;
+                        }
+                        info.version = details.version;
+                        info.source = details.source;
+                    }
+                    CheckEvent::SelectedSource { version, source } => {
+                        let mut info = worker_info.lock().unwrap_or_else(|err| err.into_inner());
+                        info.version = version;
+                        info.source = source;
+                    }
+                    CheckEvent::Progress(progress) => {
+                        worker_info
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .progress = progress.into();
+                    }
+                    CheckEvent::Installing => {
+                        let mut status =
+                            worker_status.lock().unwrap_or_else(|err| err.into_inner());
+                        *status = UpdateStatus::Installing;
+                        worker_info
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .progress = "正在启动更新安装".into();
+                    }
                 })
                 .is_ok();
-                *worker_status.lock().unwrap_or_else(|err| err.into_inner()) = if success {
-                    UpdateStatus::Current
-                } else {
-                    UpdateStatus::Failed
-                };
+                {
+                    let mut status = worker_status.lock().unwrap_or_else(|err| err.into_inner());
+                    *status = if success {
+                        UpdateStatus::Current
+                    } else {
+                        UpdateStatus::Failed
+                    };
+                    worker_info
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .progress = if success {
+                        "更新检查已完成"
+                    } else {
+                        "更新失败，可稍后重试"
+                    }
+                    .into();
+                }
                 delay = if success { CHECK_PERIOD } else { RETRY_PERIOD };
             }
         });
     if spawned.is_err() {
         *status.lock().unwrap_or_else(|err| err.into_inner()) = UpdateStatus::Failed;
+        info.lock().unwrap_or_else(|err| err.into_inner()).progress = "更新检查暂不可用".into();
     }
-    UpdateHandle { request, status }
+    UpdateHandle {
+        request,
+        status,
+        info,
+    }
 }
 
-fn check_once(installing: &mut dyn FnMut()) -> io::Result<()> {
+fn check_once(publish: &mut dyn FnMut(CheckEvent)) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     if !executable
         .file_name()
@@ -127,20 +208,36 @@ fn check_once(installing: &mut dyn FnMut()) -> io::Result<()> {
     let elevated = unsafe { IsUserAnAdmin() } != 0;
     let stage_parent = stage::parent(elevated)?;
     stage::clean_old(&stage_parent);
-    let Some(release) = download::latest(env!("CARGO_PKG_VERSION"))? else {
+    let checked = download::check_details(env!("CARGO_PKG_VERSION"))?;
+    if let Some(details) = checked.details {
+        publish(CheckEvent::Announcement(UpdateInfo {
+            version: details.version,
+            source: details.source,
+            changelog: details.changelog,
+            progress: String::new(),
+        }));
+    }
+    let Some(release) = checked.release else {
         return Ok(());
     };
     let portable = !registered_installation(&executable)?;
     let stage = stage::Stage::create(&stage_parent, elevated)?;
-    {
+    publish(CheckEvent::Progress("正在选择线路并下载"));
+    let verified = {
         let mut output = stage.create_file()?;
-        download::download(&release, &mut output)?;
+        let verified = download::download(&release, &mut output)?;
         output.sync_all()?;
-    }
+        verified
+    };
+    publish(CheckEvent::SelectedSource {
+        version: verified.version().to_owned(),
+        source: verified.source().to_owned(),
+    });
+    publish(CheckEvent::Progress("正在校验并准备更新"));
     let mut locked = stage.lock_file()?;
-    download::verify(&release, &mut locked)?;
+    download::verify(&verified, &mut locked)?;
     let args = installer_args(directory, portable);
-    installing();
+    publish(CheckEvent::Installing);
     if elevated {
         let stage_name = stage
             .directory()
@@ -249,7 +346,7 @@ mod tests {
         let handle = spawn_worker(CHECK_PERIOD, move |installing| {
             entered.send(()).unwrap();
             proceed.recv().unwrap();
-            installing();
+            installing(CheckEvent::Installing);
             proceed.recv().unwrap();
             Ok(())
         });
@@ -279,6 +376,147 @@ mod tests {
         });
         wait_for_status(&handle, UpdateStatus::Failed);
         assert!(handle.request_check());
+        wait_for_status(&handle, UpdateStatus::Current);
+    }
+
+    fn announcement() -> UpdateInfo {
+        UpdateInfo {
+            version: "0.6.8".into(),
+            source: "流年 App · CF CDN".into(),
+            changelog: "修复网络恢复后的更新检查。".into(),
+            progress: String::new(),
+        }
+    }
+
+    fn assert_announcement(handle: &UpdateHandle) {
+        let info = handle.info();
+        let expected = announcement();
+        assert_eq!(info.version, expected.version);
+        assert_eq!(info.source, expected.source);
+        assert_eq!(info.changelog, expected.changelog);
+    }
+
+    #[test]
+    fn automatic_and_manual_checks_share_and_preserve_announcement_snapshot() {
+        let (entered, checking) = mpsc::channel();
+        let (advance, proceed) = mpsc::channel();
+        let mut calls = 0;
+        let handle = spawn_worker(Duration::ZERO, move |publish| {
+            calls += 1;
+            if calls == 1 {
+                publish(CheckEvent::Announcement(announcement()));
+            }
+            entered.send(calls).unwrap();
+            proceed.recv().unwrap();
+            if calls == 2 {
+                Err(io::Error::other("simulated metadata check failed"))
+            } else {
+                Ok(())
+            }
+        });
+        let clone = handle.clone();
+        assert_eq!(checking.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+        assert_eq!(clone.status(), UpdateStatus::Checking);
+        assert_announcement(&clone);
+        advance.send(()).unwrap();
+        wait_for_status(&handle, UpdateStatus::Current);
+        assert_announcement(&handle);
+
+        assert!(clone.request_check());
+        assert_eq!(checking.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
+        assert_eq!(handle.status(), UpdateStatus::Checking);
+        assert_announcement(&handle);
+        advance.send(()).unwrap();
+        wait_for_status(&clone, UpdateStatus::Failed);
+        assert_announcement(&clone);
+
+        assert!(handle.request_check());
+        assert_eq!(checking.recv_timeout(Duration::from_secs(3)).unwrap(), 3);
+        advance.send(()).unwrap();
+        wait_for_status(&clone, UpdateStatus::Current);
+        assert_announcement(&clone);
+    }
+
+    #[test]
+    fn same_version_without_notes_preserves_cached_notes_but_new_version_clears_them() {
+        let mut calls = 0;
+        let handle = spawn_worker(Duration::ZERO, move |publish| {
+            calls += 1;
+            let mut details = announcement();
+            if calls > 1 {
+                details.changelog.clear();
+            }
+            if calls == 3 {
+                details.version = "0.6.9".into();
+            }
+            publish(CheckEvent::Announcement(details));
+            Ok(())
+        });
+        wait_for_status(&handle, UpdateStatus::Current);
+        assert_announcement(&handle);
+        assert!(handle.request_check());
+        wait_for_status(&handle, UpdateStatus::Current);
+        assert_announcement(&handle);
+        assert!(handle.request_check());
+        wait_for_status(&handle, UpdateStatus::Current);
+        assert_eq!(handle.info().version, "0.6.9");
+        assert!(handle.info().changelog.is_empty());
+    }
+
+    #[test]
+    fn failed_installation_retains_announcement_and_never_reports_current() {
+        let (entered, installing) = mpsc::channel();
+        let (advance, proceed) = mpsc::channel();
+        let handle = spawn_worker(CHECK_PERIOD, move |publish| {
+            publish(CheckEvent::Announcement(announcement()));
+            publish(CheckEvent::Progress("正在校验并准备更新"));
+            publish(CheckEvent::Installing);
+            entered.send(()).unwrap();
+            proceed.recv().unwrap();
+            Err(io::Error::other("simulated installer launch failure"))
+        });
+        assert!(handle.request_check());
+        installing.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(handle.status(), UpdateStatus::Installing);
+        advance.send(()).unwrap();
+        wait_for_status(&handle, UpdateStatus::Failed);
+        assert_announcement(&handle);
+        assert!(!handle.info().progress.contains('%'));
+    }
+
+    #[test]
+    fn download_failure_does_not_start_installation_or_discard_release_notes() {
+        let handle = spawn_worker(Duration::ZERO, move |publish| {
+            publish(CheckEvent::Announcement(announcement()));
+            publish(CheckEvent::Progress("正在选择线路并下载"));
+            Err(io::Error::other("simulated download failure"))
+        });
+        wait_for_status(&handle, UpdateStatus::Failed);
+        assert_announcement(&handle);
+    }
+
+    #[test]
+    fn verified_download_publishes_actual_selected_source_and_logical_progress() {
+        let (entered, downloading) = mpsc::channel();
+        let (advance, proceed) = mpsc::channel();
+        let handle = spawn_worker(Duration::ZERO, move |publish| {
+            publish(CheckEvent::Announcement(announcement()));
+            publish(CheckEvent::SelectedSource {
+                version: "0.6.8".into(),
+                source: "GitHub 镜像 · 单线程".into(),
+            });
+            publish(CheckEvent::Progress("正在校验并准备更新"));
+            entered.send(()).unwrap();
+            proceed.recv().unwrap();
+            Ok(())
+        });
+        downloading.recv_timeout(Duration::from_secs(3)).unwrap();
+        let info = handle.info();
+        assert_eq!(info.version, "0.6.8");
+        assert_eq!(info.source, "GitHub 镜像 · 单线程");
+        assert_eq!(info.changelog, announcement().changelog);
+        assert_eq!(info.progress, "正在校验并准备更新");
+        advance.send(()).unwrap();
         wait_for_status(&handle, UpdateStatus::Current);
     }
 

@@ -25,6 +25,7 @@ param(
     [switch]$VerifyNavigation,
     [switch]$VerifyAuthor,
     [switch]$VerifyUpdateCard,
+    [switch]$VerifyUpdateNotice,
     [switch]$VerifyPageScrollbar,
     [switch]$AlwaysShowPageScrollbar,
     [switch]$VerifyTrayActivation,
@@ -103,6 +104,7 @@ fn main() {
     };
     let requested = Rc::new(Cell::new(None::<Instant>));
     let request_time = Rc::clone(&requested);
+    let info_time = Rc::clone(&requested);
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
@@ -126,6 +128,16 @@ fn main() {
                 None => windows_ui::UpdateState::Idle,
                 Some(start) if start.elapsed() < Duration::from_millis(1200) => windows_ui::UpdateState::Checking,
                 Some(_) => windows_ui::UpdateState::Current,
+            }),
+            info: Box::new(move || windows_ui::UpdateInfo {
+                version: "0.6.8".into(),
+                source: "流年 App · CF CDN / 多线程加速；不可用时自动选择 GitHub 镜像或官方线路".into(),
+                changelog: format!("  ## 本版更新\n\t- 自动选择更新线路\n    * 支持分段下载与完整校验\n\n  安装与使用\n1. 下载完整安装包\n2. 按提示完成更新\n\n  作者：Liunian520\n  https://github.com/Liunian520/campus-network-guardian\n\n{}", "  更新说明：这是隔离预览中的演示公告，可滚动并复制。\n".repeat(18)),
+                progress: match info_time.get() {
+                    None => "尚未开始检查",
+                    Some(start) if start.elapsed() < Duration::from_millis(1200) => "正在检查更新",
+                    Some(_) => "更新检查已完成",
+                }.into(),
             }),
         },
     );
@@ -185,6 +197,8 @@ public static class GuardianPreviewNative {
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr window, int id);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll")] public static extern bool EnableWindow(IntPtr window, bool enabled);
     [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint threadId, ref GuiThreadInfo info);
@@ -214,6 +228,17 @@ public static class GuardianPreviewNative {
             if (actualPid != expectedPid) return true;
             var name = new StringBuilder(256); GetClassName(window, name, name.Capacity);
             if (!name.ToString().Contains("Guardian")) return true;
+            found = window; return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+    public static IntPtr FindPreviewNotice(uint expectedPid) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((window, parameter) => {
+            uint actualPid; GetWindowThreadProcessId(window, out actualPid);
+            if (actualPid != expectedPid) return true;
+            var name = new StringBuilder(256); GetClassName(window, name, name.Capacity);
+            if (name.ToString() != "CampusGuardianUpdateNotice") return true;
             found = window; return false;
         }, IntPtr.Zero);
         return found;
@@ -473,6 +498,132 @@ function Test-PreviewUpdateCard([IntPtr]$Window) {
     throw "The isolated update card did not display the completed check. Last caption: $caption"
 }
 
+function Test-PreviewUpdateNotice([IntPtr]$Window) {
+    $control = [GuardianPreviewNative]::GetDlgItem($Window, 305)
+    [GuardianPreviewNative]::SendMessage($control, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $notice = [IntPtr]::Zero
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        $notice = [GuardianPreviewNative]::FindPreviewNotice($previewProcess.Id)
+        if ($notice -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($notice -eq [IntPtr]::Zero) { throw 'The isolated update action did not open its native announcement window.' }
+    $title = [GuardianPreviewNative]::ReadControlText($notice)
+    if ($title -ne '更新与公告') { throw "The announcement window lacks its native title: '$title'." }
+    $bounds = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetWindowRect($notice, [ref]$bounds) | Out-Null
+    if ($bounds.Right -gt -10000 -or $bounds.Bottom -gt -10000) { throw 'The isolated notice escaped its off-screen preview owner.' }
+    $noticeWidth = $bounds.Right - $bounds.Left
+    $noticeHeight = $bounds.Bottom - $bounds.Top
+    if (($WorkAreaWidth -gt 0 -and $noticeWidth -gt $WorkAreaWidth) -or
+        ($WindowHeight -gt 0 -and $noticeHeight -gt $WindowHeight)) {
+        throw "Announcement dimensions ${noticeWidth}x${noticeHeight}px exceed the simulated work area."
+    }
+    [GuardianPreviewNative]::SendMessage($control, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    if ([GuardianPreviewNative]::FindPreviewNotice($previewProcess.Id) -ne $notice) { throw 'Repeated update clicks created a duplicate announcement window.' }
+    $edit = [GuardianPreviewNative]::GetDlgItem($notice, 631)
+    $body = [GuardianPreviewNative]::ReadControlText($edit)
+    if (-not $body.StartsWith("本版更新`r`n• 自动选择更新线路") -or $body -match '(?m)^[ \t]+[•作者安]') {
+        throw "Announcement paragraphs were not normalized to the same left edge: $body"
+    }
+    $style = [GuardianPreviewNative]::GetWindowStyle($edit, -16).ToInt64()
+    if (($style -band 0x800) -eq 0 -or ($style -band 4) -eq 0 -or ($style -band 3) -ne 0) {
+        throw 'Announcement body is not a native left-aligned readonly multiline EDIT.'
+    }
+    $format = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::SendMessageRect($edit, 0xb2, [IntPtr]::Zero, [ref]$format) | Out-Null
+    $padding = [int][Math]::Round(12 * $Dpi / 96.0)
+    $client = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetClientRect($notice, [ref]$client) | Out-Null
+    $verticalPadding = if (($client.Bottom - $client.Top) -lt 360 * $Dpi / 96.0) { [int][Math]::Round(8 * $Dpi / 96.0) } else { $padding }
+    if ([Math]::Abs($format.Left - $padding) -gt 1 -or [Math]::Abs($format.Top - $verticalPadding) -gt 1) {
+        throw "Announcement padding is [$($format.Left), $($format.Top)]px, expected [$padding, $verticalPadding]px."
+    }
+    $labelLeft = $null
+    $valueLeft = $null
+    foreach ($row in 0..3) {
+        $label = [GuardianPreviewNative+Rect]::new()
+        $value = [GuardianPreviewNative+Rect]::new()
+        [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($notice, 610+$row), [ref]$label) | Out-Null
+        [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($notice, 620+$row), [ref]$value) | Out-Null
+        if ($row -eq 0) { $labelLeft=$label.Left; $valueLeft=$value.Left }
+        if ($label.Left -ne $labelLeft -or $value.Left -ne $valueLeft -or [Math]::Abs($label.Top-$value.Top) -gt 1) {
+            throw "Native announcement label/value row $row does not share its columns and baseline."
+        }
+    }
+    $bodyBounds = [GuardianPreviewNative+Rect]::new()
+    $buttonBounds = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetWindowRect($edit, [ref]$bodyBounds) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($notice, 1), [ref]$buttonBounds) | Out-Null
+    $textHeight = $format.Bottom - $format.Top
+    $firstLine = [GuardianPreviewNative]::SendMessage($edit, 0xd6, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -shr 16
+    $secondLineStart = $body.IndexOf("`n") + 1
+    $secondLine = [GuardianPreviewNative]::SendMessage($edit, 0xd6, [IntPtr]$secondLineStart, [IntPtr]::Zero).ToInt64() -shr 16
+    $lineHeight = $secondLine - $firstLine
+    # EDIT may report formatting bounds up to two pixels inside the requested rect.
+    if ($bodyBounds.Left -ne $labelLeft -or $bodyBounds.Bottom -gt $buttonBounds.Top -or
+        $lineHeight -le 0 -or $textHeight -lt (2 * $lineHeight - 2)) {
+        $diagnostic = Join-Path $captureDir ("update-notice-$Dpi-layout-error.png")
+        Save-PreviewWindow $notice $diagnostic
+        throw "The aligned announcement must fit at least two text lines above its action row. Format: ${textHeight}px; line: ${lineHeight}px; left edges: $($bodyBounds.Left), $labelLeft. Capture: $diagnostic"
+    }
+    $check = [GuardianPreviewNative]::GetDlgItem($notice, 1)
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    while (-not [GuardianPreviewNative]::IsWindowEnabled($check) -and $elapsed.ElapsedMilliseconds -lt 3500) {
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not [GuardianPreviewNative]::IsWindowEnabled($check)) { throw 'The announcement did not enable retry after the fake check completed.' }
+    [GuardianPreviewNative]::SendMessage($notice, 0x28, $check, [IntPtr]1) | Out-Null
+    [GuardianPreviewNative]::PostMessage($check, 0x100, [IntPtr]13, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 100
+    if ([GuardianPreviewNative]::IsWindowEnabled($check)) { throw 'The announcement permits duplicate checks while checking.' }
+    if ([GuardianPreviewNative]::GetDlgCtrlID([GuardianPreviewNative]::PreviewFocus($Window)) -ne 2) {
+        throw 'Starting the check did not move focus from the disabled retry button to Close.'
+    }
+    if ((Read-PreviewControl $notice 623) -ne '正在检查更新') { throw 'Retry did not expose its logical progress in the announcement.' }
+    [GuardianPreviewNative]::SendMessage($edit, 0xb1, [IntPtr]3, [IntPtr]8) | Out-Null
+    [GuardianPreviewNative]::SendMessage($edit, 0xb6, [IntPtr]::Zero, [IntPtr]5) | Out-Null
+    $selection = [GuardianPreviewNative]::SendMessage($edit, 0xb0, [IntPtr]::Zero, [IntPtr]::Zero)
+    $line = [GuardianPreviewNative]::SendMessage($edit, 0xce, [IntPtr]::Zero, [IntPtr]::Zero)
+    $elapsed.Restart()
+    while (-not [GuardianPreviewNative]::IsWindowEnabled($check) -and $elapsed.ElapsedMilliseconds -lt 3500) {
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not [GuardianPreviewNative]::IsWindowEnabled($check)) { throw 'Retry did not complete in the announcement.' }
+    if ([GuardianPreviewNative]::SendMessage($edit, 0xb0, [IntPtr]::Zero, [IntPtr]::Zero) -ne $selection -or
+        [GuardianPreviewNative]::SendMessage($edit, 0xce, [IntPtr]::Zero, [IntPtr]::Zero) -ne $line) {
+        throw 'Status refresh reset the selection or scroll position in the announcement.'
+    }
+    [GuardianPreviewNative]::SendMessage($edit, 0xb1, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    [GuardianPreviewNative]::SendMessage($edit, 0xb6, [IntPtr]::Zero, [IntPtr](-10000)) | Out-Null
+    $capture = Join-Path $captureDir ("update-notice-$Dpi.png")
+    Save-PreviewWindow $notice $capture
+    Write-Output $capture
+    [GuardianPreviewNative]::SendMessage($notice, 0x28, $edit, [IntPtr]1) | Out-Null
+    foreach ($expected in @(1, 2, 631)) {
+        $focus = [GuardianPreviewNative]::PreviewFocus($Window)
+        [GuardianPreviewNative]::PostMessage($focus, 0x100, [IntPtr]9, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 50
+        $focus = [GuardianPreviewNative]::PreviewFocus($Window)
+        $actual = [GuardianPreviewNative]::GetDlgCtrlID($focus)
+        if ($actual -ne $expected) { throw "Announcement Tab did not reach native control $expected; actual=$actual, focus=$focus." }
+    }
+    [GuardianPreviewNative]::PostMessage($edit, 0x100, [IntPtr]27, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 100
+    if ([GuardianPreviewNative]::IsWindow($notice) -or -not [GuardianPreviewNative]::IsWindow($Window) -or $previewProcess.HasExited) {
+        throw 'Closing the announcement affected the main preview or its process.'
+    }
+    [GuardianPreviewNative]::SendMessage($control, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $reopened = [GuardianPreviewNative]::FindPreviewNotice($previewProcess.Id)
+    if ($reopened -eq [IntPtr]::Zero) { throw 'The announcement could not reopen after Escape.' }
+    $close = [GuardianPreviewNative]::GetDlgItem($reopened, 2)
+    [GuardianPreviewNative]::SendMessage($reopened, 0x28, $close, [IntPtr]1) | Out-Null
+    [GuardianPreviewNative]::PostMessage($close, 0x100, [IntPtr]13, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 100
+    if ([GuardianPreviewNative]::IsWindow($reopened) -or -not [GuardianPreviewNative]::IsWindow($Window)) { throw 'The native Close button did not close only the announcement.' }
+    'Native update notice aligns metadata and text, preserves selection/scroll, and supports Tab, Enter, and Escape.'
+}
+
 function Test-PreviewTrayActivation([IntPtr]$Window) {
     # Keep the isolated off-screen preview disabled while activating it: Windows
     # cannot give a disabled top-level window foreground keyboard focus.
@@ -643,6 +794,7 @@ $previewProcess = $null
 $previewWindow = [IntPtr]::Zero
 $priorDpi = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI')
 $priorWidth = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH')
+$priorNoticeHeight = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_NOTICE_HEIGHT')
 $priorScrollMode = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE')
 $priorStatus = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_STATUS')
 $priorError = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_ERROR')
@@ -653,6 +805,7 @@ $priorDpiContext = [GuardianPreviewNative]::SetThreadDpiAwarenessContext([IntPtr
 try {
     $env:CAMPUS_UI_PREVIEW_DPI = [string]$Dpi
     $env:CAMPUS_UI_PREVIEW_WORK_WIDTH = [string]$WorkAreaWidth
+    if ($VerifyUpdateNotice) { $env:CAMPUS_UI_PREVIEW_NOTICE_HEIGHT = [string]$WindowHeight }
     if ($VerifyPageScrollbar) {
         $env:CAMPUS_UI_PREVIEW_SCROLL_MODE = if ($AlwaysShowPageScrollbar) { 'always' } else { 'auto' }
     }
@@ -733,6 +886,9 @@ try {
     if ($VerifyUpdateCard) {
         Test-PreviewUpdateCard $previewWindow | Write-Output
     }
+    if ($VerifyUpdateNotice) {
+        Test-PreviewUpdateNotice $previewWindow | Write-Output
+    }
     if ($VerifyPageScrollbar) {
         Test-PreviewPageScrollbar $previewWindow | Write-Output
     }
@@ -755,12 +911,17 @@ try {
 } finally {
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_DPI', $priorDpi)
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDTH', $priorWidth)
+    [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_NOTICE_HEIGHT', $priorNoticeHeight)
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE', $priorScrollMode)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_STATUS', $priorStatus)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_ERROR', $priorError)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $priorLongAdapter)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_UNBROKEN_ADAPTER', $priorUnbrokenAdapter)
     if ($previewProcess -and -not $previewProcess.HasExited) {
+        $notice = [GuardianPreviewNative]::FindPreviewNotice($previewProcess.Id)
+        if ($notice -ne [IntPtr]::Zero) {
+            [GuardianPreviewNative]::PostMessage($notice, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        }
         if ($previewWindow -ne [IntPtr]::Zero) {
             # The application handles this command by destroying its own window,
             # removing its own tray icon, and leaving its UI loop.

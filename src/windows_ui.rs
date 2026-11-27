@@ -2,6 +2,10 @@
 #[path = "ui_theme.rs"]
 mod theme;
 
+#[cfg(any(windows, test))]
+#[path = "update_notice.rs"]
+mod update_notice;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -620,9 +624,24 @@ pub enum UpdateState {
     Failed,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub source: String,
+    pub changelog: String,
+    pub progress: String,
+}
+
+#[cfg(windows)]
+const APPLICATION_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
+    Some(version) => version,
+    None => "0.6.8",
+};
+
 pub struct UiUpdates {
     pub request: Box<dyn Fn()>,
     pub status: Box<dyn Fn() -> UpdateState>,
+    pub info: Box<dyn Fn() -> UpdateInfo>,
 }
 
 const DISCONNECTED_LABEL: &str = "（当前未连接）";
@@ -1611,7 +1630,26 @@ mod win {
         MessageBoxW(h, wide(msg).as_ptr(), wide("校园网守护").as_ptr(), 0x30);
     }
     fn application_version() -> &'static str {
-        option_env!("CARGO_PKG_VERSION").unwrap_or("0.5.1")
+        super::APPLICATION_VERSION
+    }
+    fn notice_snapshot() -> (UpdateState, super::UpdateInfo) {
+        unsafe {
+            app()
+                .map(|app| ((app.update.status)(), (app.update.info)()))
+                .unwrap_or((UpdateState::Idle, super::UpdateInfo::default()))
+        }
+    }
+    fn request_notice_check() {
+        unsafe {
+            if let Some(app) = app() {
+                if !matches!(
+                    (app.update.status)(),
+                    UpdateState::Checking | UpdateState::Installing
+                ) {
+                    (app.update.request)();
+                }
+            }
+        }
     }
     fn update_caption(state: UpdateState) -> (&'static str, &'static str) {
         match state {
@@ -3662,6 +3700,7 @@ mod win {
                 0
             }
             WM_DESTROY => {
+                super::update_notice::close();
                 KillTimer(h, 1);
                 if let Some(app) = app() {
                     if app.tray_available.get() {
@@ -3756,10 +3795,14 @@ mod win {
                         }
                     }
                     C_UPDATE if notification == 0 => {
-                        if let Some(app) = app() {
-                            (app.update.request)();
-                            refresh_update_card(h);
-                        }
+                        request_notice_check();
+                        refresh_update_card(h);
+                        super::update_notice::open(
+                            h,
+                            UI_DPI,
+                            notice_snapshot,
+                            request_notice_check,
+                        );
                     }
                     C_ABOUT => show_about(h),
                     C_SAVE => save_form(h),
@@ -4384,7 +4427,9 @@ mod win {
                         Ok(())
                     };
                 }
-                if IsDialogMessageW(h, &mut msg) == 0 {
+                if !super::update_notice::dispatch_dialog((&mut msg as *mut Msg).cast())
+                    && IsDialogMessageW(h, &mut msg) == 0
+                {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }

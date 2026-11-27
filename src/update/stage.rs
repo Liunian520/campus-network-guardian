@@ -133,6 +133,7 @@ impl Stage {
 
     pub(super) fn create_file(&self) -> io::Result<File> {
         OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .share_mode(0)
@@ -198,6 +199,21 @@ fn create_admin_directory(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_download_stage_can_replace_a_failed_candidate_and_read_back_the_verified_bytes() {
+        use std::io::{Read, Seek, Write};
+        let stage = Stage::create(&std::env::temp_dir(), false).unwrap();
+        let mut output = stage.create_file().unwrap();
+        output.write_all(b"incomplete previous candidate").unwrap();
+        output.set_len(0).unwrap();
+        output.rewind().unwrap();
+        output.write_all(b"verified").unwrap();
+        output.rewind().unwrap();
+        let mut actual = Vec::new();
+        output.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, b"verified");
+    }
 
     #[test]
     fn the_verified_handle_blocks_writes_and_deletion() {

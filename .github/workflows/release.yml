@@ -161,37 +161,15 @@ jobs:
         run: |
           ./tools/test-installer.ps1 -SetupPath "dist/campus-network-guardian-${env:RELEASE_VERSION}-windows-x64-setup.exe" -ExpectedVersion $env:RELEASE_VERSION
 
-      - name: Validate versions and package portable files
+      - name: Package installer and portable archives
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          . ./tools/windows-binary-version.ps1
-          $releaseVersion = $env:RELEASE_VERSION
-          $assetPrefix = "campus-network-guardian-$releaseVersion-windows-x64"
-          $nativeExe = Get-Item -LiteralPath 'target/installer-build/x86_64-pc-windows-msvc/release/campus-network-guardian.exe'
-          $setupExe = Get-Item -LiteralPath "dist/$assetPrefix-setup.exe"
-          foreach ($binary in @($nativeExe, $setupExe)) {
-            if (-not (Test-WindowsBinaryVersion -VersionInfo $binary.VersionInfo -ExpectedVersion $releaseVersion)) {
-              throw "The embedded version in $($binary.Name) does not match Cargo $releaseVersion."
-            }
+          ./tools/package-release.ps1 -ReleaseVersion $env:RELEASE_VERSION
+          $notesPath = "docs/releases/v${env:RELEASE_VERSION}.md"
+          if (Test-Path -LiteralPath $notesPath -PathType Leaf) {
+            Copy-Item -LiteralPath $notesPath -Destination 'dist/release-notes.md'
           }
-
-          # Stage only this allowlist; never archive the checkout or user data.
-          $portableDirectory = Join-Path $env:RUNNER_TEMP "campus-guardian-portable-$releaseVersion"
-          New-Item -ItemType Directory -Path $portableDirectory -Force | Out-Null
-          Copy-Item -LiteralPath $nativeExe.FullName -Destination (Join-Path $portableDirectory 'campus-network-guardian.exe')
-          Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $portableDirectory 'README.md')
-          Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $portableDirectory 'LICENSE')
-          Copy-Item -LiteralPath 'THIRD-PARTY-NOTICES.md' -Destination (Join-Path $portableDirectory 'THIRD-PARTY-NOTICES.md')
-          $portableZip = Join-Path $env:GITHUB_WORKSPACE "dist/$assetPrefix-portable.zip"
-          $portableFiles = @('campus-network-guardian.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md') | ForEach-Object { Join-Path $portableDirectory $_ }
-          Compress-Archive -LiteralPath $portableFiles -DestinationPath $portableZip -Force
-
-          $checksums = foreach ($asset in @($setupExe.FullName, $portableZip)) {
-            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $([System.IO.Path]::GetFileName($asset))"
-          }
-          Set-Content -LiteralPath 'dist/SHA256SUMS.txt' -Value $checksums -Encoding ascii
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -202,8 +180,10 @@ jobs:
           compression-level: 0
           path: |
             dist/campus-network-guardian-${{ steps.version.outputs.version }}-windows-x64-setup.exe
+            dist/campus-network-guardian-${{ steps.version.outputs.version }}-windows-x64-setup.zip
             dist/campus-network-guardian-${{ steps.version.outputs.version }}-windows-x64-portable.zip
             dist/SHA256SUMS.txt
+            dist/release-notes.md
 
       - name: Upload failed-build installer and version diagnostics
         if: failure()
@@ -234,7 +214,7 @@ jobs:
           name: windows-x64-${{ needs.build.outputs.version }}
           path: release-assets
 
-      - name: Publish installer, portable archive, and checksums
+      - name: Publish installer, archives, and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -244,8 +224,15 @@ jobs:
           $assetPrefix = "campus-network-guardian-${env:RELEASE_VERSION}-windows-x64"
           $releaseAssets = @(
             (Get-Item -LiteralPath "release-assets/$assetPrefix-setup.exe").FullName,
+            (Get-Item -LiteralPath "release-assets/$assetPrefix-setup.zip").FullName,
             (Get-Item -LiteralPath "release-assets/$assetPrefix-portable.zip").FullName,
             (Get-Item -LiteralPath 'release-assets/SHA256SUMS.txt').FullName
           )
-          gh release create $env:RELEASE_TAG --repo $env:GH_REPO --verify-tag --title "校园网守护 $env:RELEASE_TAG" --generate-notes @releaseAssets
+          $notesPath = 'release-assets/release-notes.md'
+          $notesArguments = if (Test-Path -LiteralPath $notesPath -PathType Leaf) {
+            @('--notes-file', (Get-Item -LiteralPath $notesPath).FullName)
+          } else {
+            @('--generate-notes')
+          }
+          gh release create $env:RELEASE_TAG --repo $env:GH_REPO --verify-tag --title "校园网守护 $env:RELEASE_TAG" @notesArguments @releaseAssets
           if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub release failed. Existing releases are not overwritten.' }

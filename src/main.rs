@@ -933,6 +933,7 @@ fn main() {
     });
     let updates = update::start();
     let update_status = updates.clone();
+    let update_info = updates.clone();
     let _ = windows_ui::run(
         initial,
         adapters,
@@ -950,6 +951,15 @@ fn main() {
                 update::UpdateStatus::Current => windows_ui::UpdateState::Current,
                 update::UpdateStatus::Installing => windows_ui::UpdateState::Installing,
                 update::UpdateStatus::Failed => windows_ui::UpdateState::Failed,
+            }),
+            info: Box::new(move || {
+                let info = update_info.info();
+                windows_ui::UpdateInfo {
+                    version: info.version,
+                    source: info.source,
+                    changelog: info.changelog,
+                    progress: info.progress,
+                }
             }),
         },
     );
