@@ -630,12 +630,13 @@ pub struct UpdateInfo {
     pub source: String,
     pub changelog: String,
     pub progress: String,
+    pub transfer: Option<(u64, u64)>,
 }
 
 #[cfg(windows)]
 const APPLICATION_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(version) => version,
-    None => "0.7.0",
+    None => "0.7.1",
 };
 
 pub struct UiUpdates {
@@ -1583,7 +1584,7 @@ mod win {
         taskbar_created: u32,
         last_status: RefCell<String>,
         update: UiUpdates,
-        update_state: Cell<Option<UpdateState>>,
+        update_card: Cell<Option<UpdateCardStatus>>,
         analytics: UiAnalytics,
         diagnostics: UiDiagnostics,
         history_open: Cell<bool>,
@@ -1695,23 +1696,59 @@ mod win {
             }
         }
     }
-    fn update_caption(state: UpdateState) -> (&'static str, &'static str) {
-        match state {
-            UpdateState::Idle => ("检查更新", ""),
-            UpdateState::Checking => ("正在检查", "正在检查更新"),
-            UpdateState::Current => ("已是最新版", "已是最新版本"),
-            UpdateState::Installing => ("正在安装", "正在安装更新"),
-            UpdateState::Failed => ("重试更新", "更新未完成"),
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum UpdateCardStatus {
+        Idle,
+        Checking,
+        Selecting,
+        Downloading,
+        Retrying,
+        Verifying,
+        Current,
+        Installing,
+        Failed,
+    }
+
+    impl UpdateCardStatus {
+        fn caption(self) -> (&'static str, &'static str) {
+            match self {
+                Self::Idle => ("检查更新", ""),
+                Self::Checking => ("正在检查", "正在检查更新"),
+                Self::Selecting => ("正在选线", "正在选线"),
+                Self::Downloading => ("正在下载", "正在下载安装包"),
+                Self::Retrying => ("正在重试", "正在重试下载"),
+                Self::Verifying => ("正在校验", "正在校验安装包"),
+                Self::Current => ("已是最新版", "已是最新版本"),
+                Self::Installing => ("正在安装", "正在安装更新"),
+                Self::Failed => ("重试更新", "更新未完成"),
+            }
         }
     }
     unsafe fn refresh_update_card(h: Handle) {
         let Some(app) = app() else { return };
-        let state = (app.update.status)();
-        let changed = app.update_state.replace(Some(state)) != Some(state);
+        let status = match (app.update.status)() {
+            UpdateState::Idle => UpdateCardStatus::Idle,
+            UpdateState::Checking => match (app.update.info)().progress.as_str() {
+                "正在测试下载线路" => UpdateCardStatus::Selecting,
+                "正在下载安装包" => UpdateCardStatus::Downloading,
+                "分段下载未完成，改用单线程"
+                | "当前线路失败，正在切换"
+                | "正在单线程重试"
+                | "已切换线路，正在重新下载" => UpdateCardStatus::Retrying,
+                "正在校验安装包" | "正在校验并准备更新" => {
+                    UpdateCardStatus::Verifying
+                }
+                _ => UpdateCardStatus::Checking,
+            },
+            UpdateState::Current => UpdateCardStatus::Current,
+            UpdateState::Installing => UpdateCardStatus::Installing,
+            UpdateState::Failed => UpdateCardStatus::Failed,
+        };
+        let changed = app.update_card.replace(Some(status)) != Some(status);
         if !changed && !HIGH_CONTRAST {
             return;
         }
-        let (compact_title, detail) = update_caption(state);
+        let (compact_title, detail) = status.caption();
         let native_label = if HIGH_CONTRAST && viewport_height(h) < SIDEBAR_CARD_MIN_HEIGHT {
             compact_title.to_owned()
         } else if detail.is_empty() {
@@ -3525,10 +3562,10 @@ mod win {
         let split = height < px(28);
         let stacked_text = height >= px(44);
         let update = item.control_id as usize == C_UPDATE;
-        let state = app()
-            .and_then(|app| app.update_state.get())
-            .unwrap_or(UpdateState::Idle);
-        let (compact_title, detail) = update_caption(state);
+        let status = app()
+            .and_then(|app| app.update_card.get())
+            .unwrap_or(UpdateCardStatus::Idle);
+        let (compact_title, detail) = status.caption();
         let inset = px(if split { 3 } else { 10 });
         let mut left = bounds.left + inset;
         if !split && width >= px(if stacked_text { 128 } else { 116 }) {
@@ -3549,7 +3586,7 @@ mod win {
         let right = bounds.right - inset;
         let title = if update && stacked_text {
             "检查更新"
-        } else if update && split && state == UpdateState::Current {
+        } else if update && split && status == UpdateCardStatus::Current {
             "已是最新"
         } else if update {
             compact_title
@@ -4834,7 +4871,7 @@ mod win {
                 taskbar_created,
                 last_status: RefCell::new(String::new()),
                 update,
-                update_state: Cell::new(None),
+                update_card: Cell::new(None),
                 analytics,
                 diagnostics,
                 history_open: Cell::new(false),

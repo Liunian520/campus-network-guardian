@@ -3,6 +3,7 @@ mod download;
 mod handoff;
 mod stage;
 
+use download::{DownloadProgress, RetryReason};
 use std::{
     ffi::OsString,
     fs, io,
@@ -43,12 +44,63 @@ pub struct UpdateInfo {
     pub source: String,
     pub changelog: String,
     pub progress: String,
+    pub transfer: Option<(u64, u64)>,
+}
+
+impl UpdateInfo {
+    fn set_phase(&mut self, phase: &str) {
+        self.progress = phase.to_owned();
+        self.transfer = None;
+    }
+
+    fn on_download(&mut self, event: DownloadProgress, retry: &mut Option<RetryReason>) {
+        match event {
+            DownloadProgress::Selecting => {
+                *retry = None;
+                self.set_phase("正在测试下载线路");
+            }
+            DownloadProgress::Transfer {
+                source,
+                threads,
+                received,
+                total,
+            } => {
+                self.progress = match retry {
+                    Some(RetryReason::SingleStream) => "正在单线程重试",
+                    Some(RetryReason::OtherRoute) => "已切换线路，正在重新下载",
+                    None => "正在下载安装包",
+                }
+                .into();
+                self.source = if threads == 1 {
+                    format!("{source} · 单线程")
+                } else {
+                    format!("{source} · {threads} 线程")
+                };
+                self.transfer = (total > 0).then_some((received.min(total), total));
+            }
+            DownloadProgress::Retrying { source, reason } => {
+                *retry = Some(reason);
+                self.source = source.into();
+                self.set_phase(match reason {
+                    RetryReason::SingleStream => "分段下载未完成，改用单线程",
+                    RetryReason::OtherRoute => "当前线路失败，正在切换",
+                });
+            }
+            DownloadProgress::Verifying { source } => {
+                if self.source.split(" · ").next() != Some(source) {
+                    self.source = source.into();
+                }
+                self.set_phase("正在校验安装包");
+            }
+        }
+    }
 }
 
 enum CheckEvent {
     Announcement(UpdateInfo),
     SelectedSource { version: String, source: String },
     Progress(&'static str),
+    Download(DownloadProgress),
     Installing,
 }
 
@@ -70,14 +122,14 @@ impl UpdateHandle {
             self.info
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
-                .progress = "更新检查暂不可用".into();
+                .set_phase("更新检查暂不可用");
             return false;
         }
         *status = UpdateStatus::Checking;
         self.info
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .progress = "正在检查更新".into();
+            .set_phase("正在检查更新");
         true
     }
 
@@ -107,9 +159,11 @@ pub fn start() -> UpdateHandle {
     })
 }
 
+type Publish<'a> = dyn FnMut(CheckEvent) + Send + 'a;
+
 fn spawn_worker(
     mut delay: Duration,
-    mut check: impl FnMut(&mut dyn FnMut(CheckEvent)) -> io::Result<()> + Send + 'static,
+    mut check: impl FnMut(&mut Publish<'_>) -> io::Result<()> + Send + 'static,
 ) -> UpdateHandle {
     let (request, wake) = mpsc::channel();
     let status = Arc::new(Mutex::new(UpdateStatus::Idle));
@@ -129,8 +183,9 @@ fn spawn_worker(
                     worker_info
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
-                        .progress = "正在检查更新".into();
+                        .set_phase("正在检查更新");
                 }
+                let mut retry = None;
                 let success = check(&mut |event| match event {
                     CheckEvent::Announcement(details) => {
                         let mut info = worker_info.lock().unwrap_or_else(|err| err.into_inner());
@@ -149,7 +204,13 @@ fn spawn_worker(
                         worker_info
                             .lock()
                             .unwrap_or_else(|err| err.into_inner())
-                            .progress = progress.into();
+                            .set_phase(progress);
+                    }
+                    CheckEvent::Download(event) => {
+                        worker_info
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .on_download(event, &mut retry);
                     }
                     CheckEvent::Installing => {
                         let mut status =
@@ -158,7 +219,7 @@ fn spawn_worker(
                         worker_info
                             .lock()
                             .unwrap_or_else(|err| err.into_inner())
-                            .progress = "正在启动更新安装".into();
+                            .set_phase("正在启动更新安装");
                     }
                 })
                 .is_ok();
@@ -172,19 +233,20 @@ fn spawn_worker(
                     worker_info
                         .lock()
                         .unwrap_or_else(|err| err.into_inner())
-                        .progress = if success {
-                        "更新检查已完成"
-                    } else {
-                        "更新失败，可稍后重试"
-                    }
-                    .into();
+                        .set_phase(if success {
+                            "更新检查已完成"
+                        } else {
+                            "更新失败，可稍后重试"
+                        });
                 }
                 delay = if success { CHECK_PERIOD } else { RETRY_PERIOD };
             }
         });
     if spawned.is_err() {
         *status.lock().unwrap_or_else(|err| err.into_inner()) = UpdateStatus::Failed;
-        info.lock().unwrap_or_else(|err| err.into_inner()).progress = "更新检查暂不可用".into();
+        info.lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .set_phase("更新检查暂不可用");
     }
     UpdateHandle {
         request,
@@ -193,7 +255,7 @@ fn spawn_worker(
     }
 }
 
-fn check_once(publish: &mut dyn FnMut(CheckEvent)) -> io::Result<()> {
+fn check_once(publish: &mut Publish<'_>) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     if !executable
         .file_name()
@@ -215,6 +277,7 @@ fn check_once(publish: &mut dyn FnMut(CheckEvent)) -> io::Result<()> {
             source: details.source,
             changelog: details.changelog,
             progress: String::new(),
+            transfer: None,
         }));
     }
     let Some(release) = checked.release else {
@@ -222,10 +285,14 @@ fn check_once(publish: &mut dyn FnMut(CheckEvent)) -> io::Result<()> {
     };
     let portable = !registered_installation(&executable)?;
     let stage = stage::Stage::create(&stage_parent, elevated)?;
-    publish(CheckEvent::Progress("正在选择线路并下载"));
     let verified = {
         let mut output = stage.create_file()?;
-        let verified = download::download(&release, &mut output)?;
+        let publisher = Mutex::new(&mut *publish);
+        let verified = download::download_with_progress(&release, &mut output, &|event| {
+            publisher.lock().unwrap_or_else(|error| error.into_inner())(CheckEvent::Download(
+                event,
+            ));
+        })?;
         output.sync_all()?;
         verified
     };
@@ -385,6 +452,7 @@ mod tests {
             source: "流年 App · CF CDN".into(),
             changelog: "修复网络恢复后的更新检查。".into(),
             progress: String::new(),
+            transfer: None,
         }
     }
 
@@ -518,6 +586,56 @@ mod tests {
         assert_eq!(info.progress, "正在校验并准备更新");
         advance.send(()).unwrap();
         wait_for_status(&handle, UpdateStatus::Current);
+    }
+
+    #[test]
+    fn transfer_progress_resets_on_new_route_and_clears_during_verification() {
+        let (entered, stages) = mpsc::channel();
+        let (advance, proceed) = mpsc::channel();
+        let handle = spawn_worker(Duration::ZERO, move |publish| {
+            publish(CheckEvent::Announcement(announcement()));
+            for event in [
+                DownloadProgress::Selecting,
+                DownloadProgress::Transfer {
+                    source: "流年 App",
+                    threads: 2,
+                    received: 150,
+                    total: 200,
+                },
+                DownloadProgress::Retrying {
+                    source: "流年 App",
+                    reason: RetryReason::OtherRoute,
+                },
+                DownloadProgress::Transfer {
+                    source: "GitHub",
+                    threads: 1,
+                    received: 0,
+                    total: 230,
+                },
+                DownloadProgress::Verifying { source: "GitHub" },
+            ] {
+                publish(CheckEvent::Download(event));
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+            }
+            Err(io::Error::other("simulated verification failure"))
+        });
+        for (label, bytes) in [
+            ("正在测试下载线路", None),
+            ("正在下载安装包", Some((150, 200))),
+            ("当前线路失败，正在切换", None),
+            ("已切换线路，正在重新下载", Some((0, 230))),
+            ("正在校验安装包", None),
+        ] {
+            stages.recv_timeout(Duration::from_secs(3)).unwrap();
+            let snapshot = handle.info();
+            assert_eq!(snapshot.progress, label);
+            assert_eq!(snapshot.transfer, bytes);
+            assert_eq!(snapshot.changelog, announcement().changelog);
+            advance.send(()).unwrap();
+        }
+        wait_for_status(&handle, UpdateStatus::Failed);
+        assert!(handle.info().transfer.is_none());
     }
 
     #[test]

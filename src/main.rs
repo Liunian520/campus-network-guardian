@@ -1044,6 +1044,7 @@ fn main() {
                     source: info.source,
                     changelog: info.changelog,
                     progress: info.progress,
+                    transfer: info.transfer,
                 }
             }),
         },

@@ -27,6 +27,7 @@ param(
     [switch]$VerifyAuthor,
     [switch]$VerifyUpdateCard,
     [switch]$VerifyUpdateNotice,
+    [switch]$VerifyUpdateProgress,
     [switch]$VerifyPageScrollbar,
     [switch]$AlwaysShowPageScrollbar,
     [switch]$VerifyTrayActivation,
@@ -75,6 +76,21 @@ unsafe extern "system" fn close_preview_window(window: isize, expected_pid: isiz
     GetWindowThreadProcessId(window, &mut actual_pid);
     if actual_pid == expected_pid as u32 { PostMessageW(window, 0x111, 204, 0); }
     1
+}
+fn update_fixture() -> Option<(&'static str, &'static str, Option<(u64, u64)>)> {
+    const MIB: u64 = 1024 * 1024;
+    let path = std::env::var_os("CAMPUS_PREVIEW_UPDATE_FIXTURE")?;
+    let stage = std::fs::read_to_string(path).ok()?;
+    let fixture = match stage.trim() {
+        "select" => ("正在测试下载线路", "流年 App · CF CDN", None),
+        "start" => ("正在下载安装包", "流年 App · CF CDN · 多线程", Some((8 * MIB, 32 * MIB))),
+        "advance" => ("正在下载安装包", "流年 App · CF CDN · 多线程", Some((20 * MIB, 32 * MIB))),
+        "retry" => ("当前线路失败，正在切换", "流年 App · CF CDN · 多线程", None),
+        "restart" => ("已切换线路，正在重新下载", "GitHub 镜像 · 单线程", Some((4 * MIB, 32 * MIB))),
+        "verify" => ("正在校验安装包", "GitHub 镜像 · 单线程", None),
+        _ => return None,
+    };
+    Some(fixture)
 }
 fn main() {
     // Deliberately omit main.rs, the network worker, configuration loading,
@@ -147,20 +163,31 @@ fn main() {
         Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(())),
         windows_ui::UiUpdates {
             request: Box::new(move || requested.set(Some(Instant::now()))),
-            status: Box::new(move || match request_time.get() {
-                None => windows_ui::UpdateState::Idle,
-                Some(start) if start.elapsed() < Duration::from_millis(1200) => windows_ui::UpdateState::Checking,
-                Some(_) => windows_ui::UpdateState::Current,
+            status: Box::new(move || {
+                if update_fixture().is_some() {
+                    return windows_ui::UpdateState::Checking;
+                }
+                match request_time.get() {
+                    None => windows_ui::UpdateState::Idle,
+                    Some(start) if start.elapsed() < Duration::from_millis(1200) => windows_ui::UpdateState::Checking,
+                    Some(_) => windows_ui::UpdateState::Current,
+                }
             }),
-            info: Box::new(move || windows_ui::UpdateInfo {
-                version: "0.6.8".into(),
-                source: "流年 App · CF CDN / 多线程加速；不可用时自动选择 GitHub 镜像或官方线路".into(),
-                changelog: format!("  ## 本版更新\n\t- 自动选择更新线路\n    * 支持分段下载与完整校验\n\n  安装与使用\n1. 下载完整安装包\n2. 按提示完成更新\n\n  作者：Liunian520\n  https://github.com/Liunian520/campus-network-guardian\n\n{}", "  更新说明：这是隔离预览中的演示公告，可滚动并复制。\n".repeat(18)),
-                progress: match info_time.get() {
+            info: Box::new(move || {
+                let fallback_phase = match info_time.get() {
                     None => "尚未开始检查",
                     Some(start) if start.elapsed() < Duration::from_millis(1200) => "正在检查更新",
                     Some(_) => "更新检查已完成",
-                }.into(),
+                };
+                let fixture = update_fixture();
+                let (progress, source, transfer) = fixture.unwrap_or((fallback_phase, "流年 App · CF CDN", None));
+                windows_ui::UpdateInfo {
+                    version: if fixture.is_some() { "0.7.2" } else { "0.6.8" }.into(),
+                    source: source.into(),
+                    changelog: format!("  ## 本版更新\n\t- 自动选择更新线路\n    * 支持分段下载与完整校验\n\n  安装与使用\n1. 下载完整安装包\n2. 按提示完成更新\n\n  作者：Liunian520\n  https://github.com/Liunian520/campus-network-guardian\n\n{}", "  更新说明：这是隔离预览中的演示公告，可滚动并复制。\n".repeat(18)),
+                    progress: progress.into(),
+                    transfer,
+                }
             }),
         },
         windows_ui::UiAnalytics {
@@ -610,9 +637,17 @@ function Test-PreviewUpdateNotice([IntPtr]$Window) {
     }
     if (-not [GuardianPreviewNative]::IsWindowEnabled($check)) { throw 'The announcement did not enable retry after the fake check completed.' }
     [GuardianPreviewNative]::SendMessage($notice, 0x28, $check, [IntPtr]1) | Out-Null
-    [GuardianPreviewNative]::PostMessage($check, 0x100, [IntPtr]13, [IntPtr]::Zero) | Out-Null
-    Start-Sleep -Milliseconds 100
-    if ([GuardianPreviewNative]::IsWindowEnabled($check)) { throw 'The announcement permits duplicate checks while checking.' }
+    $focusBeforeCheck = [GuardianPreviewNative]::GetDlgCtrlID([GuardianPreviewNative]::PreviewFocus($Window))
+    $queuedCheck = [GuardianPreviewNative]::PostMessage($check, 0x100, [IntPtr]13, [IntPtr]::Zero)
+    $elapsed.Restart()
+    while ([GuardianPreviewNative]::IsWindowEnabled($check) -and $elapsed.ElapsedMilliseconds -lt 700) {
+        Start-Sleep -Milliseconds 25
+    }
+    if ([GuardianPreviewNative]::IsWindowEnabled($check)) {
+        $focusAfterCheck = [GuardianPreviewNative]::GetDlgCtrlID([GuardianPreviewNative]::PreviewFocus($Window))
+        $phaseAfterCheck = Read-PreviewControl $notice 623
+        throw "The announcement retry stayed enabled after Enter. Queued=$queuedCheck, focus $focusBeforeCheck -> $focusAfterCheck, phase='$phaseAfterCheck'."
+    }
     if ([GuardianPreviewNative]::GetDlgCtrlID([GuardianPreviewNative]::PreviewFocus($Window)) -ne 2) {
         throw 'Starting the check did not move focus from the disabled retry button to Close.'
     }
@@ -658,6 +693,92 @@ function Test-PreviewUpdateNotice([IntPtr]$Window) {
     Start-Sleep -Milliseconds 100
     if ([GuardianPreviewNative]::IsWindow($reopened) -or -not [GuardianPreviewNative]::IsWindow($Window)) { throw 'The native Close button did not close only the announcement.' }
     'Native update notice aligns metadata and text, preserves selection/scroll, and supports Tab, Enter, and Escape.'
+}
+
+function Test-PreviewUpdateProgress([IntPtr]$Window) {
+    $card = [GuardianPreviewNative]::GetDlgItem($Window, 305)
+    [GuardianPreviewNative]::SendMessage($card, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $notice = [GuardianPreviewNative]::FindPreviewNotice($previewProcess.Id)
+    if ($notice -eq [IntPtr]::Zero) { throw 'Could not open the update progress preview.' }
+    $bar = [GuardianPreviewNative]::GetDlgItem($notice, 640)
+    $metrics = [GuardianPreviewNative]::GetDlgItem($notice, 641)
+    $edit = [GuardianPreviewNative]::GetDlgItem($notice, 631)
+    if ($bar -eq [IntPtr]::Zero -or $metrics -eq [IntPtr]::Zero) {
+        throw 'The notice is missing its native download progress bar or transfer numbers.'
+    }
+    $client = [GuardianPreviewNative+Rect]::new()
+    $bounds = [GuardianPreviewNative+Rect]::new()
+    $body = [GuardianPreviewNative+Rect]::new()
+    $progress = [GuardianPreviewNative+Rect]::new()
+    $numbers = [GuardianPreviewNative+Rect]::new()
+    $actions = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetClientRect($notice, [ref]$client) | Out-Null
+    [GuardianPreviewNative]::MapWindowPoints($notice, [IntPtr]::Zero, [ref]$client, 2) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($notice, [ref]$bounds) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($edit, [ref]$body) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($bar, [ref]$progress) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect($metrics, [ref]$numbers) | Out-Null
+    [GuardianPreviewNative]::GetWindowRect([GuardianPreviewNative]::GetDlgItem($notice, 2), [ref]$actions) | Out-Null
+    if (($WorkAreaWidth -gt 0 -and $bounds.Right - $bounds.Left -gt $WorkAreaWidth) -or
+        ($WindowHeight -gt 0 -and $bounds.Bottom - $bounds.Top -gt $WindowHeight) -or
+        $progress.Left -lt $client.Left -or $progress.Right -gt $numbers.Left -or
+        $numbers.Right -gt $client.Right -or $numbers.Bottom -gt $body.Top -or
+        $body.Bottom -gt $actions.Top -or $actions.Bottom -gt $client.Bottom) {
+        throw 'Download controls, notes, or actions do not fit the preview work area.'
+    }
+
+    [GuardianPreviewNative]::SendMessage($notice, 0x28, $edit, [IntPtr]1) | Out-Null
+    [GuardianPreviewNative]::SendMessage($edit, 0xb1, [IntPtr]3, [IntPtr]8) | Out-Null
+    [GuardianPreviewNative]::SendMessage($edit, 0xb6, [IntPtr]::Zero, [IntPtr]5) | Out-Null
+    $selection = [GuardianPreviewNative]::SendMessage($edit, 0xb0, [IntPtr]::Zero, [IntPtr]::Zero)
+    $line = [GuardianPreviewNative]::SendMessage($edit, 0xce, [IntPtr]::Zero, [IntPtr]::Zero)
+    foreach ($stage in @(
+        @{ Name='select'; Phase='正在测试下载线路'; Source='流年 App · CF CDN'; Card='正在选线' },
+        @{ Name='start'; Phase='正在下载安装包'; Source='流年 App · CF CDN · 多线程'; Card='正在下载'; Position=250; Metrics='25%  ·  8.0 MiB / 32.0 MiB' },
+        @{ Name='advance'; Phase='正在下载安装包'; Source='流年 App · CF CDN · 多线程'; Card='正在下载'; Position=625; Metrics='62.5%  ·  20.0 MiB / 32.0 MiB' },
+        @{ Name='retry'; Phase='当前线路失败，正在切换'; Source='流年 App · CF CDN · 多线程'; Card='正在重试' },
+        @{ Name='restart'; Phase='已切换线路，正在重新下载'; Source='GitHub 镜像 · 单线程'; Card='正在重试'; Position=125; Metrics='12.5%  ·  4.0 MiB / 32.0 MiB' },
+        @{ Name='verify'; Phase='正在校验安装包'; Source='GitHub 镜像 · 单线程'; Card='正在校验' }
+    )) {
+        [IO.File]::WriteAllText($updateFixturePath, $stage.Name)
+        [GuardianPreviewNative]::SendMessage($notice, 0x113, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+        [GuardianPreviewNative]::SendMessage($Window, 0x113, [IntPtr]1, [IntPtr]::Zero) | Out-Null
+        $phase = Read-PreviewControl $notice 623
+        $source = Read-PreviewControl $notice 622
+        $caption = [GuardianPreviewNative]::ReadControlText($card)
+        if ($phase -ne $stage.Phase -or $source -ne $stage.Source -or -not $caption.Contains($stage.Card)) {
+            throw "Incorrect phase, source, or sidebar status in $($stage.Name): '$phase', '$source', '$caption'."
+        }
+        if ($stage.ContainsKey('Position')) {
+            $position = [GuardianPreviewNative]::SendMessage($bar, 0x408, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+            if (-not [GuardianPreviewNative]::IsWindowVisible($bar) -or -not [GuardianPreviewNative]::IsWindowVisible($metrics) -or
+                $position -ne $stage.Position -or [GuardianPreviewNative]::ReadControlText($metrics) -ne $stage.Metrics) {
+                throw "Transfer stage $($stage.Name) did not expose its measured progress."
+            }
+        } elseif ([GuardianPreviewNative]::IsWindowVisible($bar) -or [GuardianPreviewNative]::IsWindowVisible($metrics)) {
+            throw "Non-transfer stage $($stage.Name) displays a percentage or progress bar."
+        }
+        $currentBody = [GuardianPreviewNative+Rect]::new()
+        [GuardianPreviewNative]::GetWindowRect($edit, [ref]$currentBody) | Out-Null
+        if ($currentBody.Top -ne $body.Top -or $currentBody.Bottom -ne $body.Bottom -or
+            [GuardianPreviewNative]::SendMessage($edit, 0xb0, [IntPtr]::Zero, [IntPtr]::Zero) -ne $selection -or
+            [GuardianPreviewNative]::SendMessage($edit, 0xce, [IntPtr]::Zero, [IntPtr]::Zero) -ne $line -or
+            [GuardianPreviewNative]::PreviewFocus($Window) -ne $edit) {
+            throw "The announcement lost its layout, selection, scroll position, or keyboard focus in $($stage.Name)."
+        }
+        if ($stage.Name -in @('advance', 'retry', 'restart', 'verify')) {
+            $capture = Join-Path $captureDir ("update-progress-$Dpi-$($stage.Name).png")
+            # Give the themed Win32 progress bar time to paint its new position.
+            if ($stage.ContainsKey('Position')) { Start-Sleep -Milliseconds 550 }
+            [GuardianPreviewNative]::SendMessage($edit, 0xb1, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+            [GuardianPreviewNative]::SendMessage($edit, 0xb6, [IntPtr]::Zero, [IntPtr](-$line.ToInt32())) | Out-Null
+            Save-PreviewWindow $notice $capture
+            [GuardianPreviewNative]::SendMessage($edit, 0xb1, [IntPtr]3, [IntPtr]8) | Out-Null
+            [GuardianPreviewNative]::SendMessage($edit, 0xb6, [IntPtr]::Zero, $line) | Out-Null
+            Write-Output $capture
+        }
+    }
+    'Native download progress reports measured bytes, resets on retry, and keeps announcement notes in place through verification.'
 }
 
 function Test-PreviewTrayActivation([IntPtr]$Window) {
@@ -957,6 +1078,8 @@ $priorWidth = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_WORK_WIDT
 $priorNoticeHeight = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_NOTICE_HEIGHT')
 $priorScrollMode = [Environment]::GetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE')
 $priorStatus = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_STATUS')
+$priorUpdateFixture = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_UPDATE_FIXTURE')
+$updateFixturePath = Join-Path $captureDir 'update-stage.txt'
 $priorError = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_ERROR')
 $priorLongAdapter = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER')
 $priorUnbrokenAdapter = [Environment]::GetEnvironmentVariable('CAMPUS_PREVIEW_UNBROKEN_ADAPTER')
@@ -965,7 +1088,8 @@ $priorDpiContext = [GuardianPreviewNative]::SetThreadDpiAwarenessContext([IntPtr
 try {
     $env:CAMPUS_UI_PREVIEW_DPI = [string]$Dpi
     $env:CAMPUS_UI_PREVIEW_WORK_WIDTH = [string]$WorkAreaWidth
-    if ($VerifyUpdateNotice) { $env:CAMPUS_UI_PREVIEW_NOTICE_HEIGHT = [string]$WindowHeight }
+    if ($VerifyUpdateNotice -or $VerifyUpdateProgress) { $env:CAMPUS_UI_PREVIEW_NOTICE_HEIGHT = [string]$WindowHeight }
+    if ($VerifyUpdateProgress) { $env:CAMPUS_PREVIEW_UPDATE_FIXTURE = $updateFixturePath }
     if ($VerifyPageScrollbar) {
         $env:CAMPUS_UI_PREVIEW_SCROLL_MODE = if ($AlwaysShowPageScrollbar) { 'always' } else { 'auto' }
     }
@@ -1049,6 +1173,9 @@ try {
     if ($VerifyUpdateNotice) {
         Test-PreviewUpdateNotice $previewWindow | Write-Output
     }
+    if ($VerifyUpdateProgress) {
+        Test-PreviewUpdateProgress $previewWindow | Write-Output
+    }
     if ($VerifyPageScrollbar) {
         Test-PreviewPageScrollbar $previewWindow | Write-Output
     }
@@ -1083,6 +1210,7 @@ try {
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_NOTICE_HEIGHT', $priorNoticeHeight)
     [Environment]::SetEnvironmentVariable('CAMPUS_UI_PREVIEW_SCROLL_MODE', $priorScrollMode)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_STATUS', $priorStatus)
+    [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_UPDATE_FIXTURE', $priorUpdateFixture)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_ERROR', $priorError)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_LONG_ADAPTER', $priorLongAdapter)
     [Environment]::SetEnvironmentVariable('CAMPUS_PREVIEW_UNBROKEN_ADAPTER', $priorUnbrokenAdapter)

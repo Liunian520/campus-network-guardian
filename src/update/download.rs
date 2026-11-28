@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -47,6 +48,30 @@ pub(super) struct VerifiedInstaller {
     digest: [u8; 32],
     version: String,
     source: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DownloadProgress {
+    Selecting,
+    Transfer {
+        source: &'static str,
+        threads: usize,
+        received: u64,
+        total: u64,
+    },
+    Retrying {
+        source: &'static str,
+        reason: RetryReason,
+    },
+    Verifying {
+        source: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RetryReason {
+    SingleStream,
+    OtherRoute,
 }
 
 impl VerifiedInstaller {
@@ -117,6 +142,77 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const RANGE_THRESHOLD: u64 = 1024 * 1024;
 const PROBE_BYTES: u64 = 64 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(125);
+
+struct TransferProgress<'a> {
+    report: &'a (dyn Fn(DownloadProgress) + Sync),
+    source: &'static str,
+    threads: usize,
+    total: u64,
+    bytes: Mutex<TransferBytes>,
+}
+
+#[derive(Default)]
+struct TransferBytes {
+    received: u64,
+    last_report: Option<Instant>,
+}
+
+impl<'a> TransferProgress<'a> {
+    fn new(
+        report: &'a (dyn Fn(DownloadProgress) + Sync),
+        source: &'static str,
+        threads: usize,
+        total: u64,
+    ) -> Self {
+        let progress = Self {
+            report,
+            source,
+            threads,
+            total,
+            bytes: Mutex::default(),
+        };
+        progress.publish_transfer(0);
+        progress
+    }
+
+    fn publish_transfer(&self, received: u64) {
+        (self.report)(DownloadProgress::Transfer {
+            source: self.source,
+            threads: self.threads,
+            received,
+            total: self.total,
+        });
+    }
+
+    fn record(&self, count: usize) {
+        let mut bytes = self.bytes.lock().unwrap_or_else(|err| err.into_inner());
+        bytes.received += count as u64;
+        let now = Instant::now();
+        // Publish under the same lock so concurrent ranges cannot reorder snapshots.
+        if bytes.received < self.total
+            && bytes
+                .last_report
+                .is_none_or(|last| now.duration_since(last) >= PROGRESS_INTERVAL)
+        {
+            self.publish_transfer(bytes.received);
+            bytes.last_report = Some(now);
+        }
+    }
+
+    fn verifying(&self) {
+        let received = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .received;
+        debug_assert_eq!(received, self.total);
+        self.publish_transfer(received);
+        (self.report)(DownloadProgress::Verifying {
+            source: self.source,
+        });
+    }
+}
 
 fn parse_url(value: &str) -> io::Result<Url> {
     if value.len() > 16 * 1024
@@ -228,7 +324,12 @@ fn validate_range(response: &http::Response, start: u64, end: u64, total: u64) -
     Ok(())
 }
 
-fn read_exact_body(reader: impl Read, expected: u64, deadline: Instant) -> io::Result<Vec<u8>> {
+fn read_exact_body(
+    reader: impl Read,
+    expected: u64,
+    deadline: Instant,
+    progress: Option<&TransferProgress<'_>>,
+) -> io::Result<Vec<u8>> {
     if expected > MAX_INSTALLER_BYTES {
         return Err(invalid("update response exceeds size limit"));
     }
@@ -246,6 +347,9 @@ fn read_exact_body(reader: impl Read, expected: u64, deadline: Instant) -> io::R
             return Err(invalid("update response exceeds its expected size"));
         }
         data.extend_from_slice(&buffer[..count]);
+        if let Some(progress) = progress {
+            progress.record(count);
+        }
     }
     if data.len() as u64 != expected {
         return Err(invalid("truncated update response"));
@@ -404,8 +508,9 @@ fn parallel_bytes(
     candidate: &Candidate,
     transport: &impl Transport,
     deadline: Instant,
-) -> io::Result<(Vec<u8>, usize, bool)> {
-    let threads = ((candidate.size / (1024 * 1024)) as usize).clamp(2, 4);
+    progress: &TransferProgress<'_>,
+) -> io::Result<(Vec<u8>, bool)> {
+    let threads = progress.threads;
     let chunk = candidate.size.div_ceil(threads as u64);
     let parts = std::thread::scope(|scope| {
         let workers = (0..threads)
@@ -421,7 +526,12 @@ fn parallel_bytes(
                         deadline,
                     )?;
                     validate_range(&response, start, end, candidate.size)?;
-                    let bytes = read_exact_body(response.reader, end - start + 1, deadline)?;
+                    let bytes = read_exact_body(
+                        response.reader,
+                        end - start + 1,
+                        deadline,
+                        Some(progress),
+                    )?;
                     Ok((bytes, service_cdn(&url)))
                 })
             })
@@ -441,7 +551,7 @@ fn parallel_bytes(
         bytes.extend_from_slice(&part);
         via_cdn &= part_via_cdn;
     }
-    Ok((bytes, threads, via_cdn))
+    Ok((bytes, via_cdn))
 }
 
 fn reset(output: &mut File) -> io::Result<()> {
@@ -455,6 +565,7 @@ fn hash_copy(
     reader: impl Read,
     output: &mut impl Write,
     deadline: Instant,
+    progress: Option<&TransferProgress<'_>>,
 ) -> io::Result<()> {
     let mut input = reader.take(expected.size + 1);
     let mut checksum = Sha256::new();
@@ -471,10 +582,19 @@ fn hash_copy(
         if total > expected.size {
             return Err(invalid("installer exceeds its published size"));
         }
+        if let Some(progress) = progress {
+            progress.record(count);
+        }
         checksum.update(&buffer[..count]);
         output.write_all(&buffer[..count])?;
     }
-    if total != expected.size || checksum.finalize()[..] != expected.digest {
+    if total != expected.size {
+        return Err(invalid("installer size or SHA-256 mismatch"));
+    }
+    if let Some(progress) = progress {
+        progress.verifying();
+    }
+    if checksum.finalize()[..] != expected.digest {
         return Err(invalid("installer size or SHA-256 mismatch"));
     }
     Ok(())
@@ -486,6 +606,7 @@ fn install_payload(
     reader: impl Read,
     output: &mut File,
     deadline: Instant,
+    progress: Option<&TransferProgress<'_>>,
 ) -> io::Result<VerifiedInstaller> {
     let outer = VerifiedInstaller {
         size: candidate.size,
@@ -494,10 +615,13 @@ fn install_payload(
         source: String::new(),
     };
     if candidate.payload == Payload::Installer {
-        hash_copy(&outer, reader, output, deadline)?;
+        hash_copy(&outer, reader, output, deadline, progress)?;
         return Ok(outer);
     }
-    let bytes = read_exact_body(reader, candidate.size, deadline)?;
+    let bytes = read_exact_body(reader, candidate.size, deadline, progress)?;
+    if let Some(progress) = progress {
+        progress.verifying();
+    }
     if Sha256::digest(&bytes)[..] != candidate.digest {
         return Err(invalid("installer ZIP SHA-256 mismatch"));
     }
@@ -537,34 +661,55 @@ fn install_payload(
     Ok(verified)
 }
 
+#[cfg(test)]
 fn download_with(
     release: &Release,
     output: &mut File,
     transport: &impl Transport,
 ) -> io::Result<VerifiedInstaller> {
-    download_with_timeout(release, output, transport, DOWNLOAD_TIMEOUT)
+    download_with_transport(release, output, transport, DOWNLOAD_TIMEOUT, &|_| {})
 }
 
-fn download_with_timeout(
+fn download_with_transport(
     release: &Release,
     output: &mut File,
     transport: &impl Transport,
     attempt_timeout: Duration,
+    report: &(impl Fn(DownloadProgress) + Sync),
 ) -> io::Result<VerifiedInstaller> {
-    let ranked = ranked_candidates(release, transport);
-    for (candidate, ranges) in ranked {
+    report(DownloadProgress::Selecting);
+    let mut ranked = ranked_candidates(release, transport).into_iter().peekable();
+    while let Some((candidate, ranges)) = ranked.next() {
         reset(output)?;
+        let source = match candidate.family {
+            Family::Service => "流年 App",
+            Family::Mirror => "GitHub 镜像",
+            _ => "GitHub",
+        };
         let mut successful = None;
         if ranges && candidate.size >= RANGE_THRESHOLD {
             let deadline = Instant::now() + attempt_timeout;
-            if let Ok((bytes, threads, via_cdn)) = parallel_bytes(&candidate, transport, deadline) {
-                if let Ok(verified) =
-                    install_payload(release, &candidate, Cursor::new(bytes), output, deadline)
-                {
+            let threads = ((candidate.size / RANGE_THRESHOLD) as usize).clamp(2, 4);
+            let progress = TransferProgress::new(report, source, threads, candidate.size);
+            if let Ok((bytes, via_cdn)) = parallel_bytes(&candidate, transport, deadline, &progress)
+            {
+                progress.verifying();
+                if let Ok(verified) = install_payload(
+                    release,
+                    &candidate,
+                    Cursor::new(bytes),
+                    output,
+                    deadline,
+                    None,
+                ) {
                     successful = Some((verified, threads, via_cdn));
                 }
             }
             if successful.is_none() {
+                report(DownloadProgress::Retrying {
+                    source,
+                    reason: RetryReason::SingleStream,
+                });
                 reset(output)?;
             }
         }
@@ -573,6 +718,7 @@ fn download_with_timeout(
         } else {
             (|| {
                 let deadline = Instant::now() + attempt_timeout;
+                let progress = TransferProgress::new(report, source, 1, candidate.size);
                 let (response, url) =
                     fetch(transport, &candidate.url, candidate.family, None, deadline)?;
                 identity(&response)?;
@@ -583,16 +729,22 @@ fn download_with_timeout(
                 {
                     return Err(invalid("invalid installer download response"));
                 }
-                install_payload(release, &candidate, response.reader, output, deadline)
-                    .map(|verified| (verified, 1, service_cdn(&url)))
+                install_payload(
+                    release,
+                    &candidate,
+                    response.reader,
+                    output,
+                    deadline,
+                    Some(&progress),
+                )
+                .map(|verified| (verified, 1, service_cdn(&url)))
             })()
         };
         if let Ok((mut verified, threads, via_cdn)) = result {
-            let label = match candidate.family {
-                Family::Service if via_cdn => "流年 App · CF CDN",
-                Family::Service => "流年 App",
-                Family::Mirror => "GitHub 镜像",
-                _ => "GitHub",
+            let label = if candidate.family == Family::Service && via_cdn {
+                "流年 App · CF CDN"
+            } else {
+                source
             };
             verified.source = format!(
                 "{label} · {}",
@@ -603,6 +755,12 @@ fn download_with_timeout(
                 }
             );
             return Ok(verified);
+        }
+        if ranked.peek().is_some() {
+            report(DownloadProgress::Retrying {
+                source,
+                reason: RetryReason::OtherRoute,
+            });
         }
     }
     reset(output)?;
@@ -990,8 +1148,12 @@ fn verify_installer(
     Ok(())
 }
 
-pub(super) fn download(release: &Release, output: &mut File) -> io::Result<VerifiedInstaller> {
-    download_with(release, output, &Network)
+pub(super) fn download_with_progress(
+    release: &Release,
+    output: &mut File,
+    report: &(impl Fn(DownloadProgress) + Sync),
+) -> io::Result<VerifiedInstaller> {
+    download_with_transport(release, output, &Network, DOWNLOAD_TIMEOUT, report)
 }
 
 pub(super) fn verify(verified: &VerifiedInstaller, input: &mut impl Read) -> io::Result<()> {
@@ -1000,6 +1162,7 @@ pub(super) fn verify(verified: &VerifiedInstaller, input: &mut impl Read) -> io:
         input,
         &mut io::sink(),
         Instant::now() + DOWNLOAD_TIMEOUT,
+        None,
     )
 }
 
@@ -1394,6 +1557,118 @@ mod tests {
     }
 
     #[test]
+    fn progress_counts_actual_parallel_body_bytes_before_verifying() {
+        let data = vec![0x51; RANGE_THRESHOLD as usize];
+        let mut release = bytes_release(&data);
+        release.candidates.truncate(1);
+        let total = data.len() as u64;
+        let transport = FakeTransport(|_: &Url, range| Ok(response(&data, range, total)));
+        let events = std::sync::Mutex::new(Vec::new());
+        let (path, mut output) = file();
+        let result = download_with_transport(
+            &release,
+            &mut output,
+            &transport,
+            DOWNLOAD_TIMEOUT,
+            &|event| events.lock().unwrap().push(event),
+        );
+        drop(output);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap().source().ends_with("2 线程"));
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.first(), Some(&DownloadProgress::Selecting));
+        assert_eq!(
+            events.last(),
+            Some(&DownloadProgress::Verifying {
+                source: "GitHub 镜像",
+            })
+        );
+        let received = events[1..events.len() - 1]
+            .iter()
+            .map(|event| match event {
+                DownloadProgress::Transfer {
+                    source: "GitHub 镜像",
+                    threads: 2,
+                    received,
+                    total: length,
+                } if *length == total => *received,
+                _ => panic!("unexpected event {event:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(received[0], 0);
+        assert!(received[1] > 0 && received[1] < PROBE_BYTES);
+        assert!(received.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(received.last(), Some(&total));
+    }
+
+    #[test]
+    fn progress_resets_on_single_stream_and_other_route_fallbacks() {
+        let data = vec![0x51; RANGE_THRESHOLD as usize];
+        let release = bytes_release(&data);
+        let total = data.len() as u64;
+        let transport = FakeTransport(|url: &Url, range: Option<(u64, u64)>| {
+            if url.host != MIRROR && range.is_some() {
+                return Err(invalid("simulated unavailable probe"));
+            }
+            let mut reply = response(&data, range, total);
+            if url.host == MIRROR && range.is_some_and(|(_, end)| end >= PROBE_BYTES) {
+                reply.content_range = Some("bytes 0-10/11".into());
+            }
+            if url.host == MIRROR && range.is_none() {
+                reply.reader = Box::new(Cursor::new(vec![0x51; 1024]));
+            }
+            Ok(reply)
+        });
+        let events = std::sync::Mutex::new(Vec::new());
+        let (path, mut output) = file();
+        let result = download_with_transport(
+            &release,
+            &mut output,
+            &transport,
+            DOWNLOAD_TIMEOUT,
+            &|event| events.lock().unwrap().push(event),
+        );
+        drop(output);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap().source(), "GitHub · 单线程");
+        let events = events.into_inner().unwrap();
+        let transfer = |source, threads, received| DownloadProgress::Transfer {
+            source,
+            threads,
+            received,
+            total,
+        };
+        assert_eq!(
+            &events[..7],
+            &[
+                DownloadProgress::Selecting,
+                transfer("GitHub 镜像", 2, 0),
+                DownloadProgress::Retrying {
+                    source: "GitHub 镜像",
+                    reason: RetryReason::SingleStream,
+                },
+                transfer("GitHub 镜像", 1, 0),
+                transfer("GitHub 镜像", 1, 1024),
+                DownloadProgress::Retrying {
+                    source: "GitHub 镜像",
+                    reason: RetryReason::OtherRoute,
+                },
+                transfer("GitHub", 1, 0),
+            ]
+        );
+        assert!(events[7..].iter().all(|event| match event {
+            DownloadProgress::Transfer { source, .. } | DownloadProgress::Verifying { source } =>
+                *source == "GitHub",
+            _ => false,
+        }));
+        assert_eq!(events[events.len() - 2], transfer("GitHub", 1, total));
+        assert_eq!(
+            events.last(),
+            Some(&DownloadProgress::Verifying { source: "GitHub" })
+        );
+    }
+
+    #[test]
     fn range_unsupported_or_wrong_content_range_falls_back_to_verified_single_stream() {
         let data = vec![0x51; 2 * 1024 * 1024];
         let release = bytes_release(&data);
@@ -1462,11 +1737,12 @@ mod tests {
             single_requests: AtomicUsize::new(0),
         };
         let (path, mut output) = file();
-        let result = download_with_timeout(
+        let result = download_with_transport(
             &release,
             &mut output,
             &transport,
             Duration::from_millis(300),
+            &|_| {},
         );
         output.rewind().unwrap();
         let mut actual = Vec::new();

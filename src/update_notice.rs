@@ -53,9 +53,15 @@ mod win {
     const VALUES: [i32; 4] = [620, 621, 622, 623];
     const NOTES_LABEL: i32 = 630;
     const NOTES: i32 = 631;
+    const TRANSFER_BAR: i32 = 640;
+    const TRANSFER_TEXT: i32 = 641;
     const CHECK: i32 = 1;
     const CLOSE: i32 = 2;
     const WM_SETFONT: u32 = 0x30;
+    const ICC_PROGRESS_CLASS: u32 = 0x20;
+    const PBM_SETPOS: u32 = 0x402;
+    const PBM_SETRANGE32: u32 = 0x406;
+    const TRANSFER_SCALE: u32 = 1000;
     const DM_GETDEFID: u32 = 0x400;
     const DC_HASDEFID: isize = 0x534b;
     thread_local! { static WINDOW: Cell<Handle> = const { Cell::new(0) }; }
@@ -150,6 +156,16 @@ mod win {
         notice: Option<Box<Notice>>,
     }
 
+    #[repr(C)]
+    struct CommonControls {
+        size: u32,
+        classes: u32,
+    }
+
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn InitCommonControlsEx(controls: *const CommonControls) -> i32;
+    }
     #[link(name = "user32")]
     extern "system" {
         fn RegisterClassW(class: *const WndClass) -> u16;
@@ -206,10 +222,6 @@ mod win {
         fn GetSysColorBrush(index: i32) -> Handle;
         fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
         fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
-        fn GetDC(hwnd: Handle) -> Handle;
-        fn ReleaseDC(hwnd: Handle, dc: Handle) -> i32;
-        fn DrawTextW(dc: Handle, text: *const u16, count: i32, rect: *mut Rect, format: u32)
-            -> i32;
         fn InvalidateRect(hwnd: Handle, rect: *const Rect, erase: i32) -> i32;
     }
     #[link(name = "kernel32")]
@@ -235,7 +247,6 @@ mod win {
             face: *const u16,
         ) -> Handle;
         fn DeleteObject(object: Handle) -> i32;
-        fn SelectObject(dc: Handle, object: Handle) -> Handle;
         fn SetTextColor(dc: Handle, color: u32) -> u32;
         fn SetBkColor(dc: Handle, color: u32) -> u32;
     }
@@ -434,8 +445,15 @@ mod win {
             child(hwnd, "STATIC", caption, 0x80, id);
         }
         for id in VALUES {
-            child(hwnd, "STATIC", "", 0x80, id);
+            child(hwnd, "STATIC", "", 0x4080, id);
         }
+        InitCommonControlsEx(&CommonControls {
+            size: std::mem::size_of::<CommonControls>() as u32,
+            classes: ICC_PROGRESS_CLASS,
+        });
+        let bar = child(hwnd, "msctls_progress32", "下载进度", 0x01, TRANSFER_BAR);
+        SendMessageW(bar, PBM_SETRANGE32, 0, TRANSFER_SCALE as isize);
+        child(hwnd, "STATIC", "", 0x282, TRANSFER_TEXT);
         child(hwnd, "STATIC", "版本说明", 0x80, NOTES_LABEL);
         child(hwnd, "EDIT", "", 0x00210844, NOTES);
         child(hwnd, "BUTTON", "重新检查", 0x10001, CHECK);
@@ -453,6 +471,8 @@ mod win {
             621,
             622,
             623,
+            TRANSFER_BAR,
+            TRANSFER_TEXT,
             NOTES_LABEL,
             NOTES,
             CHECK,
@@ -472,6 +492,7 @@ mod win {
             621,
             622,
             623,
+            TRANSFER_TEXT,
             NOTES_LABEL,
             NOTES,
             CHECK,
@@ -494,6 +515,53 @@ mod win {
     unsafe fn put(hwnd: Handle, id: i32, text: &str) {
         SetWindowTextW(GetDlgItem(hwnd, id), wide(text).as_ptr());
     }
+
+    fn format_bytes(bytes: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * KIB;
+        const GIB: u64 = KIB * MIB;
+        if bytes >= GIB {
+            format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        } else if bytes >= MIB {
+            format!("{:.1} MiB", bytes as f64 / MIB as f64)
+        } else if bytes >= KIB {
+            format!("{:.1} KiB", bytes as f64 / KIB as f64)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
+    unsafe fn refresh_transfer(hwnd: Handle, transfer: Option<(u64, u64)>) {
+        let bar = GetDlgItem(hwnd, TRANSFER_BAR);
+        let text = GetDlgItem(hwnd, TRANSFER_TEXT);
+        if let Some((downloaded, total)) = transfer.filter(|(_, total)| *total != 0) {
+            let position = (u128::from(downloaded.min(total)) * u128::from(TRANSFER_SCALE)
+                / u128::from(total)) as usize;
+            let percent = if position % 10 == 0 {
+                format!("{}%", position / 10)
+            } else {
+                format!("{}.{}%", position / 10, position % 10)
+            };
+            SendMessageW(bar, PBM_SETPOS, position, 0);
+            put(
+                hwnd,
+                TRANSFER_TEXT,
+                &format!(
+                    "{percent}  ·  {} / {}",
+                    format_bytes(downloaded),
+                    format_bytes(total)
+                ),
+            );
+            ShowWindow(bar, 8);
+            ShowWindow(text, 8);
+        } else {
+            ShowWindow(bar, 0);
+            ShowWindow(text, 0);
+            SendMessageW(bar, PBM_SETPOS, 0, 0);
+            put(hwnd, TRANSFER_TEXT, "");
+        }
+    }
+
     unsafe fn refresh(hwnd: Handle, notice: &Notice) {
         let (state, info) = (notice.snapshot)();
         let previous = notice.last.borrow();
@@ -506,18 +574,23 @@ mod win {
             return;
         }
         let before = previous.as_ref().map(|(_, info)| info);
-        if previous.as_ref().map(|(state, _)| *state) != Some(state) {
+        let state_changed = previous.as_ref().map(|(state, _)| *state) != Some(state);
+        let phase_changed = before.map(|old| &old.progress) != Some(&info.progress);
+        if state_changed || phase_changed {
             put(
                 hwnd,
                 VALUES[0],
                 match state {
                     UpdateState::Idle => "尚未检查",
-                    UpdateState::Checking => "正在检查",
+                    UpdateState::Checking if info.progress == "正在检查更新" => "正在检查",
+                    UpdateState::Checking => "更新进行中",
                     UpdateState::Current => "已是最新版本",
                     UpdateState::Installing => "正在安装更新",
                     UpdateState::Failed => "更新未完成，可重新检查",
                 },
             );
+        }
+        if state_changed {
             let check = GetDlgItem(hwnd, CHECK);
             let available = !matches!(state, UpdateState::Checking | UpdateState::Installing);
             if !available && GetFocus() == check {
@@ -547,7 +620,7 @@ mod win {
                 },
             );
         }
-        if before.map(|old| &old.progress) != Some(&info.progress) {
+        if phase_changed {
             put(
                 hwnd,
                 VALUES[3],
@@ -558,6 +631,10 @@ mod win {
                 },
             );
         }
+        if before.is_none() || before.and_then(|old| old.transfer) != info.transfer {
+            refresh_transfer(hwnd, info.transfer);
+        }
+        let mut needs_layout = before.is_none();
         if before.map(|old| &old.changelog) != Some(&info.changelog) {
             let body = normalize_notes(&info.changelog);
             let body = if body.is_empty() {
@@ -568,12 +645,12 @@ mod win {
             if *notice.body.borrow() != body {
                 put(hwnd, NOTES, &body);
                 *notice.body.borrow_mut() = body;
+                needs_layout = true;
             }
         }
-        let layout_changed = before.map(|old| &old.source) != Some(&info.source);
         drop(previous);
         *notice.last.borrow_mut() = Some((state, info));
-        if layout_changed {
+        if needs_layout {
             layout(hwnd, notice);
         }
     }
@@ -617,27 +694,6 @@ mod win {
                 s(23),
             );
         }
-        let source = notice
-            .last
-            .borrow()
-            .as_ref()
-            .map(|(_, info)| info.source.clone())
-            .unwrap_or_default();
-        let mut source_rect = Rect {
-            right: value_width,
-            ..Rect::default()
-        };
-        let dc = GetDC(hwnd);
-        let old_font = SelectObject(dc, notice.font.get());
-        DrawTextW(
-            dc,
-            wide(&source).as_ptr(),
-            -1,
-            &mut source_rect,
-            0x400 | 0x10 | 0x800,
-        );
-        SelectObject(dc, old_font);
-        ReleaseDC(hwnd, dc);
         let row_height = s(if short {
             21
         } else if compact {
@@ -645,7 +701,6 @@ mod win {
         } else {
             28
         });
-        let source_height = (source_rect.bottom + s(6)).max(row_height);
         let mut y = s(if short {
             46
         } else if compact {
@@ -654,11 +709,27 @@ mod win {
             94
         });
         for row in 0..4 {
-            let height = if row == 2 { source_height } else { row_height };
-            bounds(LABELS[row], margin, y, s(80), height);
-            bounds(VALUES[row], value_x, y, value_width, height);
-            y += height;
+            bounds(LABELS[row], margin, y, s(80), row_height);
+            bounds(VALUES[row], value_x, y, value_width, row_height);
+            y += row_height;
         }
+        let text_width = s(204).min((value_width - s(36)).max(1));
+        let bar_height = s(10);
+        bounds(
+            TRANSFER_BAR,
+            value_x,
+            y + (row_height - bar_height) / 2,
+            (value_width - text_width - s(12)).max(1),
+            bar_height,
+        );
+        bounds(
+            TRANSFER_TEXT,
+            value_x + value_width - text_width,
+            y,
+            text_width,
+            row_height,
+        );
+        y += row_height;
         bounds(
             NOTES_LABEL,
             margin,
