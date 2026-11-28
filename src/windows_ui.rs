@@ -635,7 +635,7 @@ pub struct UpdateInfo {
 #[cfg(windows)]
 const APPLICATION_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(version) => version,
-    None => "0.6.9",
+    None => "0.7.0",
 };
 
 pub struct UiUpdates {
@@ -647,6 +647,12 @@ pub struct UiUpdates {
 pub struct UiAnalytics {
     pub enabled: Box<dyn Fn() -> bool>,
     pub set_enabled: Box<dyn Fn(bool) -> Result<(), String>>,
+}
+
+pub struct UiDiagnostics {
+    pub summary: Box<dyn Fn() -> String>,
+    pub report: Box<dyn Fn() -> String>,
+    pub check_external: Box<dyn Fn()>,
 }
 
 const DISCONNECTED_LABEL: &str = "（当前未连接）";
@@ -760,7 +766,8 @@ mod win {
         adapter_options, autostart_value_matches, connection_heading, copy_utf16,
         matches_terminated_username, notify_network_change, notify_quit, overview_network_text,
         scale_for_dpi, settings_allowed, settings_failure_message, settings_transaction,
-        should_notify, Adapter, Event, PanelWidth, Settings, UiAnalytics, UiUpdates, UpdateState,
+        should_notify, Adapter, Event, PanelWidth, Settings, UiAnalytics, UiDiagnostics, UiUpdates,
+        UpdateState,
     };
     use super::{tray_action, TrayAction, TRAY_ICON_ID, WM_LBUTTONDBLCLK};
     use std::{
@@ -845,6 +852,12 @@ mod win {
     const C_LABEL_SECONDARY_ADAPTER: usize = 137;
     const C_ANALYTICS: usize = 138;
     const C_ANALYTICS_DISCLOSURE: usize = 139;
+    const C_DIAGNOSTICS_TITLE: usize = 140;
+    const C_DIAGNOSTICS_SUMMARY: usize = 141;
+    const C_DIAGNOSTICS_HISTORY: usize = 142;
+    const C_DIAGNOSTICS_COPY: usize = 143;
+    const C_DIAGNOSTICS_REPORT: usize = 144;
+    const C_DIAGNOSTICS_FEEDBACK: usize = 145;
     const C_NAV_OVERVIEW: usize = 301;
     const C_NAV_SETTINGS: usize = 302;
     const C_AUTHOR: usize = 303;
@@ -857,6 +870,7 @@ mod win {
     const M_QUIT: usize = 204;
     const M_TRAY_PANEL: usize = 205;
     const M_ANALYTICS: usize = 206;
+    const M_CHECK_EXTERNAL: usize = 207;
     const BM_GETCHECK: u32 = 0xf0;
     const BM_SETCHECK: u32 = 0xf1;
     const WS_CHILD: u32 = 0x40000000;
@@ -869,6 +883,8 @@ mod win {
     const CONTENT_HEIGHT: i32 = 600;
     const COMPACT_OVERVIEW_HEIGHT: i32 = 360;
     const COMPACT_OVERVIEW_SHIFT: i32 = 32;
+    const DIAGNOSTICS_TOP: i32 = 320;
+    const RECOVERY_REPORT_HEIGHT: i32 = 156;
     const NETWORK_FIELD_ROW_HEIGHT: i32 = 24;
     const ADAPTER_COMBO_WIDTH: i32 = 220;
     const ANALYTICS_TOP: i32 = 596;
@@ -1068,6 +1084,10 @@ mod win {
         fn GetWindowTextLengthW(h: Handle) -> i32;
         fn GetWindowTextW(h: Handle, s: *mut u16, n: i32) -> i32;
         fn SetWindowTextW(h: Handle, s: *const u16) -> i32;
+        fn OpenClipboard(h: Handle) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(format: u32, memory: Handle) -> Handle;
+        fn CloseClipboard() -> i32;
         fn MessageBoxW(h: Handle, text: *const u16, title: *const u16, style: u32) -> i32;
         fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
         fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
@@ -1128,6 +1148,10 @@ mod win {
         fn GetModuleHandleW(name: *const u16) -> Handle;
         fn CreateMutexW(attrs: *const c_void, owner: i32, name: *const u16) -> Handle;
         fn GetLastError() -> u32;
+        fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+        fn GlobalLock(memory: Handle) -> *mut c_void;
+        fn GlobalUnlock(memory: Handle) -> i32;
+        fn GlobalFree(memory: Handle) -> Handle;
     }
     #[link(name = "shell32")]
     extern "system" {
@@ -1561,6 +1585,8 @@ mod win {
         update: UiUpdates,
         update_state: Cell<Option<UpdateState>>,
         analytics: UiAnalytics,
+        diagnostics: UiDiagnostics,
+        history_open: Cell<bool>,
         generation: Arc<AtomicU64>,
         gate: Arc<Mutex<()>>,
     }
@@ -1605,6 +1631,8 @@ mod win {
     static mut BUILD_PAGE: u8 = 0;
     static mut HOVERED_BUTTON: Handle = 0;
     static mut HERO_EXTRA: i32 = 0;
+    static mut DIAGNOSTICS_HEIGHT: i32 = 0;
+    static mut DIAGNOSTICS_SUMMARY_HEIGHT: i32 = 20;
     static mut NETWORK_TEXT_HEIGHT: i32 = 28;
     static mut NETWORK_DETAIL_HEIGHT: i32 = 20;
     static mut OVERVIEW_HEIGHT: i32 = CONTENT_HEIGHT;
@@ -1787,7 +1815,11 @@ mod win {
                 HERO_FONT
             } else if matches!(
                 id,
-                C_SECTION | C_FORM_NETWORK | C_FORM_ACCOUNT | C_FORM_AUTOMATION
+                C_SECTION
+                    | C_FORM_NETWORK
+                    | C_FORM_ACCOUNT
+                    | C_FORM_AUTOMATION
+                    | C_DIAGNOSTICS_TITLE
             ) {
                 SECTION_FONT
             } else if matches!(
@@ -1806,6 +1838,7 @@ mod win {
                     | C_FORM_FEEDBACK
                     | C_ADAPTER_DETAIL
                     | C_ANALYTICS_DISCLOSURE
+                    | C_DIAGNOSTICS_FEEDBACK
                     | C_ABOUT
             ) {
                 SMALL_FONT
@@ -1878,15 +1911,22 @@ mod win {
         _: usize,
         _: usize,
     ) -> isize {
-        if m == 0x87 && GetDlgCtrlID(h) as usize == C_STATUS {
+        let id = GetDlgCtrlID(h) as usize;
+        if m == 0x87 && matches!(id, C_STATUS | C_DIAGNOSTICS_REPORT) {
             // A multiline EDIT normally claims every key. Keep its arrow and
             // selection handling, but let dialog navigation handle Tab so the
-            // read-only status remains accessible without trapping focus.
-            return DefSubclassProc(h, m, w, l) & !(0x2 | 0x4);
+            // read-only text remains accessible without trapping focus.
+            let flags = DefSubclassProc(h, m, w, l) & !(0x2 | 0x4);
+            // Remove DLGC_HASSETSEL so dialog Tab leaves the history readable.
+            return if id == C_DIAGNOSTICS_REPORT {
+                flags & !0x8
+            } else {
+                flags
+            };
         }
         // The combo remains a native keyboard- and accessibility-aware dropdown.
         // Only its closed surface is painted to match the rounded input shell.
-        if !HIGH_CONTRAST && matches!(GetDlgCtrlID(h) as usize, C_ADAPTER | C_SECONDARY_ADAPTER) {
+        if !HIGH_CONTRAST && matches!(id, C_ADAPTER | C_SECONDARY_ADAPTER) {
             if m == 0xf {
                 let mut paint: Paint = zeroed();
                 let dc = BeginPaint(h, &mut paint);
@@ -2058,11 +2098,52 @@ mod win {
         NETWORK_TEXT_HEIGHT = measured_height(h, &text(h, C_NETWORK_VALUE), UI_FONT, 496).max(28);
         NETWORK_DETAIL_HEIGHT =
             measured_height(h, &text(h, C_NETWORK_DESC), SMALL_FONT, 496).max(20);
-        let network_y = 320 + HERO_EXTRA;
+        let diagnostics_y = DIAGNOSTICS_TOP + HERO_EXTRA;
+        let summary_height = DIAGNOSTICS_SUMMARY_HEIGHT;
+        let summary_y = diagnostics_y + 48;
+        let actions_y = summary_y + summary_height + 12;
+        let feedback = text(h, C_DIAGNOSTICS_FEEDBACK);
+        let feedback_height = measured_height(h, &feedback, SMALL_FONT, 496);
+        let feedback_y = actions_y + 46;
+        let report_y = feedback_y
+            + if feedback_height > 0 {
+                feedback_height + 8
+            } else {
+                0
+            };
+        let history_open = app().is_some_and(|app| app.history_open.get());
+        let diagnostics_end = if history_open {
+            report_y + RECOVERY_REPORT_HEIGHT + 16
+        } else if feedback_height > 0 {
+            feedback_y + feedback_height + 16
+        } else {
+            actions_y + 56
+        };
+        DIAGNOSTICS_HEIGHT = diagnostics_end - diagnostics_y;
+        let network_y = diagnostics_end + 16;
         let network_height = 76 + NETWORK_TEXT_HEIGHT + NETWORK_DETAIL_HEIGHT;
         set_control_bounds(C_STATUS, 216, 180, 496, status_height);
         set_control_bounds(M_CHECK, 192, 256 + HERO_EXTRA, 144, 40);
         set_control_bounds(M_OPEN, 352, 256 + HERO_EXTRA, 176, 40);
+        set_control_bounds(M_CHECK_EXTERNAL, 544, 256 + HERO_EXTRA, 152, 40);
+        set_control_bounds(C_DIAGNOSTICS_TITLE, 216, diagnostics_y + 18, 496, 24);
+        set_control_bounds(C_DIAGNOSTICS_SUMMARY, 216, summary_y, 496, summary_height);
+        set_control_bounds(C_DIAGNOSTICS_HISTORY, 216, actions_y, 148, 36);
+        set_control_bounds(C_DIAGNOSTICS_COPY, 376, actions_y, 116, 36);
+        set_control_bounds(
+            C_DIAGNOSTICS_FEEDBACK,
+            216,
+            feedback_y,
+            496,
+            feedback_height,
+        );
+        set_control_bounds(
+            C_DIAGNOSTICS_REPORT,
+            216,
+            report_y,
+            496,
+            RECOVERY_REPORT_HEIGHT,
+        );
         set_control_bounds(C_NETWORK_LABEL, 216, network_y + 20, 496, 20);
         set_control_bounds(
             C_NETWORK_VALUE,
@@ -2130,7 +2211,33 @@ mod win {
         } else {
             ShowScrollBar(status_control, 1, 0);
         }
+        if history_open {
+            fit_history_report(GetDlgItem(h, C_DIAGNOSTICS_REPORT as i32));
+        }
         configure_scroll(h);
+    }
+
+    unsafe fn fit_history_report(control: Handle) {
+        let mut inner: Rect = zeroed();
+        GetClientRect(control, &mut inner);
+        let padding = scale_for_dpi(8, UI_DPI);
+        inner.left += padding;
+        inner.right = (inner.right - padding).max(inner.left + 1);
+        inner.top += padding;
+        inner.bottom -= padding;
+        let first = SendMessageW(control, 0xce, 0, 0) as usize;
+        let line_top = |line| {
+            let index = SendMessageW(control, 0xbb, line, 0) as i32;
+            (index >= 0)
+                .then(|| (SendMessageW(control, 0xd6, index as usize, 0) >> 16) as i16 as i32)
+        };
+        if let (Some(first), Some(second)) = (line_top(first), line_top(first + 1)) {
+            let line_height = second - first;
+            if line_height > 0 {
+                inner.bottom = inner.top + (inner.bottom - inner.top) / line_height * line_height;
+            }
+        }
+        SendMessageW(control, 0xb3, 0, (&inner as *const Rect) as isize);
     }
 
     unsafe fn measure_form_text(h: Handle) {
@@ -2223,6 +2330,7 @@ mod win {
     unsafe fn layout_controls(h: Handle) {
         let viewport_height = viewport_height(h);
         let compact_overview = viewport_height < COMPACT_OVERVIEW_HEIGHT;
+        let history_open = app().is_some_and(|app| app.history_open.get());
         let compact_sidebar = viewport_height < 328;
         let footer_visible = viewport_height >= 208;
         let split_footer = viewport_height < 272;
@@ -2266,7 +2374,8 @@ mod win {
                 }
                 let visible = (item.page == 0 || item.page == ACTIVE_PAGE)
                     && (!matches!(id, C_AUTHOR | C_UPDATE | C_ABOUT) || footer_visible)
-                    && !(compact_overview && matches!(id, C_SUBTITLE | C_STATUS_LABEL));
+                    && !(compact_overview && matches!(id, C_SUBTITLE | C_STATUS_LABEL))
+                    && (id != C_DIAGNOSTICS_REPORT || history_open);
                 ShowWindow(item.hwnd, if visible { 5 } else { 0 });
                 let offset = if item.page == 0 { 0 } else { SCROLL_OFFSET };
                 let (x, y, width, height) = match id {
@@ -2538,9 +2647,105 @@ mod win {
                 wide(&network_display_text(h, &network, UI_FONT, 496)).as_ptr(),
             );
             SetWindowTextW(GetDlgItem(h, C_NETWORK_DESC as i32), wide(&detail).as_ptr());
+            refresh_diagnostics(h, app);
             update_overview_layout(h);
             InvalidateRect(h, null(), 1);
         }
+    }
+    unsafe fn refresh_diagnostics(h: Handle, app: &App) -> bool {
+        let summary = (app.diagnostics.summary)();
+        let summary = if summary.is_empty() {
+            "等待首次诊断。"
+        } else {
+            &summary
+        };
+        let previous_height = DIAGNOSTICS_SUMMARY_HEIGHT;
+        if text(h, C_DIAGNOSTICS_SUMMARY) != summary {
+            SetWindowTextW(
+                GetDlgItem(h, C_DIAGNOSTICS_SUMMARY as i32),
+                wide(summary).as_ptr(),
+            );
+            DIAGNOSTICS_SUMMARY_HEIGHT = measured_height(h, summary, UI_FONT, 496).max(20);
+        }
+        if app.history_open.get() {
+            let report = (app.diagnostics.report)();
+            // The inline view starts at the history. Clipboard copying uses the full report.
+            let history = report
+                .match_indices("最近恢复记录")
+                .find(|(offset, _)| *offset == 0 || report.as_bytes()[offset - 1] == b'\n')
+                .map_or(report.as_str(), |(offset, _)| &report[offset..]);
+            if text(h, C_DIAGNOSTICS_REPORT) != history {
+                let control = GetDlgItem(h, C_DIAGNOSTICS_REPORT as i32);
+                let mut selection_start = 0u32;
+                let mut selection_end = 0u32;
+                SendMessageW(
+                    control,
+                    0xb0,
+                    (&mut selection_start as *mut u32) as usize,
+                    (&mut selection_end as *mut u32) as isize,
+                );
+                let first_line = SendMessageW(control, 0xce, 0, 0);
+                SetWindowTextW(control, wide(history).as_ptr());
+                SendMessageW(
+                    control,
+                    0xb1,
+                    selection_start as usize,
+                    selection_end as isize,
+                );
+                SendMessageW(
+                    control,
+                    0xb6,
+                    0,
+                    first_line - SendMessageW(control, 0xce, 0, 0),
+                );
+            }
+        }
+        previous_height != DIAGNOSTICS_SUMMARY_HEIGHT
+    }
+    unsafe fn copy_to_clipboard(h: Handle, report: &str) -> bool {
+        const GMEM_MOVEABLE: u32 = 0x0002;
+        const CF_UNICODETEXT: u32 = 13;
+        let utf16 = wide(report);
+        let memory = GlobalAlloc(GMEM_MOVEABLE, utf16.len() * size_of::<u16>());
+        if memory == 0 {
+            return false;
+        }
+        let buffer = GlobalLock(memory).cast::<u16>();
+        if buffer.is_null() {
+            GlobalFree(memory);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), buffer, utf16.len());
+        GlobalUnlock(memory);
+        let copied = if OpenClipboard(h) != 0 {
+            let copied = EmptyClipboard() != 0 && SetClipboardData(CF_UNICODETEXT, memory) != 0;
+            CloseClipboard();
+            copied
+        } else {
+            false
+        };
+        // Windows owns the block once SetClipboardData succeeds.
+        if !copied {
+            GlobalFree(memory);
+        }
+        copied
+    }
+    unsafe fn copy_diagnostics(h: Handle, app: &App) {
+        let report = (app.diagnostics.report)();
+        let preview = cfg!(debug_assertions) && std::env::var_os("CAMPUS_UI_PREVIEW_DPI").is_some();
+        let feedback = if preview {
+            "演示诊断已生成。"
+        } else if copy_to_clipboard(h, &report) {
+            "已复制诊断。"
+        } else {
+            "无法复制诊断，请重试。"
+        };
+        SetWindowTextW(
+            GetDlgItem(h, C_DIAGNOSTICS_FEEDBACK as i32),
+            wide(feedback).as_ptr(),
+        );
+        update_overview_layout(h);
+        ensure_focus_visible(h);
     }
     unsafe fn save_form(h: Handle) {
         if let Some(app) = app() {
@@ -3074,6 +3279,12 @@ mod win {
         let focus_id = GetDlgCtrlID(focus) as usize;
         let companion = if focus_id == C_ANALYTICS {
             C_ANALYTICS_DISCLOSURE
+        } else if focus_id == C_DIAGNOSTICS_HISTORY
+            && app().is_some_and(|app| app.history_open.get())
+        {
+            C_DIAGNOSTICS_REPORT
+        } else if focus_id == C_DIAGNOSTICS_COPY && !text(h, C_DIAGNOSTICS_FEEDBACK).is_empty() {
+            C_DIAGNOSTICS_FEEDBACK
         } else if ACTIVE_PAGE == 2 && FORM_SHIFT > 0 && focus_id == FORM_ERROR_FIELD {
             C_FORM_FEEDBACK
         } else {
@@ -3207,19 +3418,20 @@ mod win {
                 theme::HERO,
                 theme::HERO,
             );
-            rounded(
-                dc,
-                &dip_rect(
-                    192,
-                    320 + HERO_EXTRA - shift,
-                    544,
-                    76 + NETWORK_TEXT_HEIGHT + NETWORK_DETAIL_HEIGHT,
-                    true,
-                ),
-                12,
-                theme::SURFACE,
-                theme::SURFACE_BORDER,
-            );
+            let y = DIAGNOSTICS_TOP + HERO_EXTRA - shift;
+            let network_height = 76 + NETWORK_TEXT_HEIGHT + NETWORK_DETAIL_HEIGHT;
+            for (top, height) in [
+                (y, DIAGNOSTICS_HEIGHT),
+                (y + DIAGNOSTICS_HEIGHT + 16, network_height),
+            ] {
+                rounded(
+                    dc,
+                    &dip_rect(192, top, 544, height, true),
+                    12,
+                    theme::SURFACE,
+                    theme::SURFACE_BORDER,
+                );
+            }
         } else {
             for (y, height) in [(88, 96), (200, 152), (368, 152)] {
                 let shift = form_feedback_shift(y)
@@ -3410,6 +3622,8 @@ mod win {
             &item.rect,
             if navigation || footer {
                 SIDEBAR_BRUSH
+            } else if matches!(id, C_DIAGNOSTICS_HISTORY | C_DIAGNOSTICS_COPY) {
+                CARD_BRUSH
             } else {
                 BACKGROUND_BRUSH
             },
@@ -3621,8 +3835,12 @@ mod win {
     unsafe extern "system" fn wndproc(h: Handle, m: u32, w: usize, l: isize) -> isize {
         match m {
             WM_SIZE => {
-                configure_scroll(h);
-                layout_controls(h);
+                if ACTIVE_PAGE == 1 && app().is_some() {
+                    update_overview_layout(h);
+                } else {
+                    configure_scroll(h);
+                    layout_controls(h);
+                }
                 0
             }
             WM_VSCROLL => {
@@ -3689,6 +3907,9 @@ mod win {
                         | C_ABOUT
                         | M_CHECK
                         | M_OPEN
+                        | M_CHECK_EXTERNAL
+                        | C_DIAGNOSTICS_HISTORY
+                        | C_DIAGNOSTICS_COPY
                 ) {
                     draw_button(item);
                     1
@@ -3713,6 +3934,7 @@ mod win {
                         | C_HTTP_HINT
                         | C_ADAPTER_DETAIL
                         | C_ANALYTICS_DISCLOSURE
+                        | C_DIAGNOSTICS_FEEDBACK
                 );
                 let on_background = matches!(
                     id,
@@ -3793,6 +4015,13 @@ mod win {
                 if w == 1 {
                     refresh_status();
                     refresh_update_card(h);
+                    if ACTIVE_PAGE == 1 && IsWindowVisible(h) != 0 {
+                        if let Some(app) = app() {
+                            if refresh_diagnostics(h, app) {
+                                update_overview_layout(h);
+                            }
+                        }
+                    }
                 }
                 0
             }
@@ -3906,6 +4135,37 @@ mod win {
                             let _ = app.tx.send(Event::CheckNow);
                         }
                     }
+                    M_CHECK_EXTERNAL if notification == 0 => {
+                        if let Some(app) = app() {
+                            (app.diagnostics.check_external)();
+                            if refresh_diagnostics(h, app) {
+                                update_overview_layout(h);
+                            }
+                        }
+                    }
+                    C_DIAGNOSTICS_HISTORY if notification == 0 => {
+                        if let Some(app) = app() {
+                            let open = !app.history_open.get();
+                            app.history_open.set(open);
+                            let label = if open {
+                                "隐藏恢复记录"
+                            } else {
+                                "查看恢复记录"
+                            };
+                            SetWindowTextW(
+                                GetDlgItem(h, C_DIAGNOSTICS_HISTORY as i32),
+                                wide(label).as_ptr(),
+                            );
+                            refresh_diagnostics(h, app);
+                            update_overview_layout(h);
+                            ensure_focus_visible(h);
+                        }
+                    }
+                    C_DIAGNOSTICS_COPY if notification == 0 => {
+                        if let Some(app) = app() {
+                            copy_diagnostics(h, app);
+                        }
+                    }
                     M_SETTINGS => {
                         open_panel(h, 2);
                     }
@@ -3943,6 +4203,7 @@ mod win {
         gate: Arc<Mutex<()>>,
         update: UiUpdates,
         analytics: UiAnalytics,
+        diagnostics: UiDiagnostics,
     ) -> Result<(), String> {
         unsafe {
             SetProcessDPIAware();
@@ -4177,6 +4438,73 @@ mod win {
                 176,
                 40,
                 M_OPEN,
+            );
+            control(
+                h,
+                "BUTTON",
+                "检测外网",
+                WS_TABSTOP | button_style,
+                544,
+                256,
+                152,
+                40,
+                M_CHECK_EXTERNAL,
+            );
+            control(
+                h,
+                "STATIC",
+                "连接诊断",
+                0,
+                216,
+                338,
+                496,
+                24,
+                C_DIAGNOSTICS_TITLE,
+            );
+            control(
+                h,
+                "STATIC",
+                "等待首次诊断。",
+                0,
+                216,
+                368,
+                496,
+                20,
+                C_DIAGNOSTICS_SUMMARY,
+            );
+            control(
+                h,
+                "BUTTON",
+                "查看恢复记录",
+                WS_TABSTOP | button_style,
+                216,
+                400,
+                148,
+                36,
+                C_DIAGNOSTICS_HISTORY,
+            );
+            control(
+                h,
+                "BUTTON",
+                "复制诊断",
+                WS_TABSTOP | button_style,
+                376,
+                400,
+                116,
+                36,
+                C_DIAGNOSTICS_COPY,
+            );
+            control(h, "STATIC", "", 0, 216, 446, 496, 0, C_DIAGNOSTICS_FEEDBACK);
+            control(
+                h,
+                "EDIT",
+                "",
+                WS_TABSTOP | 0x4 | 0x40 | 0x800 | 0x200000 | 0x800000,
+                216,
+                446,
+                496,
+                RECOVERY_REPORT_HEIGHT,
+                C_DIAGNOSTICS_REPORT,
             );
             control(
                 h,
@@ -4508,6 +4836,8 @@ mod win {
                 update,
                 update_state: Cell::new(None),
                 analytics,
+                diagnostics,
+                history_open: Cell::new(false),
                 generation,
                 gate,
             });

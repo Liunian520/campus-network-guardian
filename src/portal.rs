@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PORTAL: Ipv4Addr = Ipv4Addr::new(172, 30, 21, 100);
 const PORTAL_HOST: &str = "172.30.21.100";
 const PROBE_HOST: &str = "www.msftconnecttest.com";
 const PROBE_PATH: &str = "/connecttest.txt";
+const PROBE_BODY: &str = "Microsoft Connect Test";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_PROBE_RESPONSE: usize = 8 * 1024;
 const MAX_RESPONSE: u64 = 256 * 1024;
 
 #[cfg(all(test, windows))]
@@ -65,6 +68,13 @@ pub enum DialState {
 pub enum PortalStatus {
     Offline,
     Online(DialState),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalReachability {
+    Reachable,
+    PortalRedirect,
+    Inconclusive,
+    NetworkChanged,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortalError {
@@ -166,22 +176,7 @@ impl PortalClient {
         {
             return Err(PortalError::ContextUnknown);
         }
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|_| PortalError::Network)?;
-        if let Some(index) = self.interface_index {
-            bind_interface(&socket, index)?;
-        }
-        #[cfg(not(test))]
-        if self.interface_index.is_none() {
-            return Err(PortalError::NetworkChanged);
-        }
-        socket
-            .bind(&SocketAddr::V4(SocketAddrV4::new(self.local, 0)).into())
-            .map_err(|_| PortalError::Network)?;
-        socket
-            .connect_timeout(&SocketAddr::V4(remote).into(), Duration::from_secs(5))
-            .map_err(|_| PortalError::Network)?;
-        let mut stream: TcpStream = socket.into();
+        let mut stream = self.connect(remote, Duration::from_secs(5))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|_| PortalError::Network)?;
@@ -224,7 +219,109 @@ impl PortalClient {
         if (method == "POST" || allow_redirect) && bytes.is_empty() {
             return Err(PortalError::Network);
         }
-        parse_http_inner(&bytes, allow_redirect)
+        let kind = if allow_redirect {
+            HttpResponseKind::Redirect
+        } else {
+            HttpResponseKind::Success
+        };
+        parse_http_inner(&bytes, kind)
+    }
+    fn connect(&self, remote: SocketAddrV4, timeout: Duration) -> Result<TcpStream, PortalError> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|_| PortalError::Network)?;
+        if let Some(index) = self.interface_index {
+            bind_interface(&socket, index)?;
+        }
+        #[cfg(not(test))]
+        if self.interface_index.is_none() {
+            return Err(PortalError::NetworkChanged);
+        }
+        socket
+            .bind(&SocketAddr::V4(SocketAddrV4::new(self.local, 0)).into())
+            .map_err(|_| PortalError::Network)?;
+        socket
+            .connect_timeout(&SocketAddr::V4(remote).into(), timeout)
+            .map_err(|_| PortalError::Network)?;
+        Ok(socket.into())
+    }
+    /// Check a fixed IPv4 connectivity endpoint from the chosen interface.
+    pub fn check_external(&self) -> ExternalReachability {
+        if !(self.guard)() {
+            return ExternalReachability::NetworkChanged;
+        }
+        let deadline = Instant::now() + PROBE_TIMEOUT;
+        let check = || {
+            for remote in self.probe_addresses()? {
+                remaining_probe_time(deadline)?;
+                if !(self.guard)() {
+                    return Err(PortalError::NetworkChanged);
+                }
+                match self.request_external_probe(remote, deadline) {
+                    Ok(response) => {
+                        if !response.redirect && response.body == PROBE_BODY {
+                            return Ok(ExternalReachability::Reachable);
+                        }
+                        if response.redirect
+                            && response
+                                .location
+                                .as_deref()
+                                .is_some_and(|location| captive_route(location, self.local).is_ok())
+                        {
+                            return Ok(ExternalReachability::PortalRedirect);
+                        }
+                        return Ok(ExternalReachability::Inconclusive);
+                    }
+                    Err(PortalError::Network) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(ExternalReachability::Inconclusive)
+        };
+        let result = check();
+        if !(self.guard)() || result == Err(PortalError::NetworkChanged) {
+            return ExternalReachability::NetworkChanged;
+        }
+        result.unwrap_or(ExternalReachability::Inconclusive)
+    }
+    fn request_external_probe(
+        &self,
+        remote: SocketAddrV4,
+        deadline: Instant,
+    ) -> Result<Response, PortalError> {
+        let connect_timeout = remaining_probe_time(deadline)?.min(Duration::from_secs(3));
+        let mut stream = self.connect(remote, connect_timeout)?;
+        if !(self.guard)() {
+            return Err(PortalError::NetworkChanged);
+        }
+        stream
+            .set_write_timeout(Some(remaining_probe_time(deadline)?))
+            .map_err(|_| PortalError::Network)?;
+        let request = format!(
+            "GET {PROBE_PATH} HTTP/1.1\r\nHost: {PROBE_HOST}\r\nConnection: close\r\nAccept: text/plain\r\nAccept-Encoding: identity\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|_| PortalError::Network)?;
+        let mut bytes = Vec::new();
+        let mut block = [0; 1024];
+        loop {
+            stream
+                .set_read_timeout(Some(remaining_probe_time(deadline)?))
+                .map_err(|_| PortalError::Network)?;
+            let count = stream.read(&mut block).map_err(|_| PortalError::Network)?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len() + count > MAX_PROBE_RESPONSE {
+                return Err(PortalError::Unexpected);
+            }
+            bytes.extend_from_slice(&block[..count]);
+        }
+        if bytes.is_empty() {
+            return Err(PortalError::Network);
+        }
+        remaining_probe_time(deadline)?;
+        parse_http_inner(&bytes, HttpResponseKind::ExternalProbe)
     }
     /// Discover context from an intercepted connectivity probe. The portal's
     /// default route can identify an unrelated campus NAS and is never used.
@@ -360,6 +457,13 @@ impl PortalClient {
             Err(PortalError::Unexpected)
         }
     }
+}
+
+fn remaining_probe_time(deadline: Instant) -> Result<Duration, PortalError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|time| !time.is_zero())
+        .ok_or(PortalError::Network)
 }
 
 #[cfg(not(test))]
@@ -555,12 +659,19 @@ struct Response {
     body: String,
     cookie: Option<String>,
     location: Option<String>,
+    redirect: bool,
+}
+#[derive(PartialEq, Eq)]
+enum HttpResponseKind {
+    Success,
+    Redirect,
+    ExternalProbe,
 }
 #[cfg(test)]
 fn parse_http(bytes: &[u8]) -> Result<Response, PortalError> {
-    parse_http_inner(bytes, false)
+    parse_http_inner(bytes, HttpResponseKind::Success)
 }
-fn parse_http_inner(bytes: &[u8], allow_redirect: bool) -> Result<Response, PortalError> {
+fn parse_http_inner(bytes: &[u8], kind: HttpResponseKind) -> Result<Response, PortalError> {
     let split = bytes
         .windows(4)
         .position(|x| x == b"\r\n\r\n")
@@ -570,9 +681,15 @@ fn parse_http_inner(bytes: &[u8], allow_redirect: bool) -> Result<Response, Port
     let first = lines.next().ok_or(PortalError::Unexpected)?;
     let ok = first.starts_with("HTTP/1.1 200 ") || first.starts_with("HTTP/1.0 200 ");
     let redirect = first.starts_with("HTTP/1.1 302 ") || first.starts_with("HTTP/1.0 302 ");
-    if !ok && !(allow_redirect && redirect) {
+    let expected_status = match kind {
+        HttpResponseKind::Success => ok,
+        HttpResponseKind::Redirect => redirect,
+        HttpResponseKind::ExternalProbe => ok || redirect,
+    };
+    if !expected_status {
         return Err(PortalError::Unexpected);
     }
+    let external = kind == HttpResponseKind::ExternalProbe;
     let mut cookie = None;
     let mut location = None;
     let mut chunked = false;
@@ -586,16 +703,19 @@ fn parse_http_inner(bytes: &[u8], allow_redirect: bool) -> Result<Response, Port
             }
             location = Some(value.to_owned());
         }
-        if key.eq_ignore_ascii_case("set-cookie") && value.starts_with("yudear=") {
+        if !external && key.eq_ignore_ascii_case("set-cookie") && value.starts_with("yudear=") {
             cookie = Some(value.split(';').next().unwrap_or("").to_owned());
         }
         if key.eq_ignore_ascii_case("transfer-encoding") {
-            if !value.eq_ignore_ascii_case("chunked") {
+            if !value.eq_ignore_ascii_case("chunked") || (external && chunked) {
                 return Err(PortalError::Unexpected);
             }
             chunked = true;
         }
         if key.eq_ignore_ascii_case("content-length") {
+            if external && (length.is_some() || !value.bytes().all(|byte| byte.is_ascii_digit())) {
+                return Err(PortalError::Unexpected);
+            }
             length = Some(
                 value
                     .parse::<usize>()
@@ -605,7 +725,10 @@ fn parse_http_inner(bytes: &[u8], allow_redirect: bool) -> Result<Response, Port
     }
     let raw = &bytes[split + 4..];
     let data = if chunked {
-        decode_chunks(raw)?
+        if external && length.is_some() {
+            return Err(PortalError::Unexpected);
+        }
+        decode_chunks(raw, external)?
     } else {
         if let Some(n) = length {
             if raw.len() != n {
@@ -615,16 +738,17 @@ fn parse_http_inner(bytes: &[u8], allow_redirect: bool) -> Result<Response, Port
         raw.to_vec()
     };
     let body = String::from_utf8(data).map_err(|_| PortalError::Unexpected)?;
-    if allow_redirect && (!redirect || location.is_none()) {
+    if redirect && location.is_none() {
         return Err(PortalError::Unexpected);
     }
     Ok(Response {
         body,
         cookie,
         location,
+        redirect,
     })
 }
-fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, PortalError> {
+fn decode_chunks(mut data: &[u8], require_end: bool) -> Result<Vec<u8>, PortalError> {
     let mut out = Vec::new();
     loop {
         let p = data
@@ -636,9 +760,15 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, PortalError> {
             .split(';')
             .next()
             .ok_or(PortalError::Unexpected)?;
+        if require_end && !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(PortalError::Unexpected);
+        }
         let n = usize::from_str_radix(size, 16).map_err(|_| PortalError::Unexpected)?;
         data = &data[p + 2..];
         if n == 0 {
+            if require_end && data != b"\r\n" {
+                return Err(PortalError::Unexpected);
+            }
             return Ok(out);
         }
         if n > data.len().saturating_sub(2) || &data[n..n + 2] != b"\r\n" {
@@ -974,10 +1104,18 @@ mod tests {
 mod transport_tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     fn serve(responses: Vec<&'static str>) -> (PortalClient, thread::JoinHandle<Vec<String>>) {
+        serve_with(responses, || {})
+    }
+    fn serve_with(
+        responses: Vec<&'static str>,
+        before_response: impl Fn() + Send + 'static,
+    ) -> (PortalClient, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let client = PortalClient {
             local: Ipv4Addr::LOCALHOST,
@@ -989,8 +1127,19 @@ mod transport_tests {
         let task = thread::spawn(move || {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut stream, peer) = listener.accept().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let (mut stream, peer) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "loopback request never arrived");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("loopback listener failed: {error}"),
+                    }
+                };
                 assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1014,6 +1163,7 @@ mod transport_tests {
                     }
                 }
                 requests.push(String::from_utf8(buf).unwrap());
+                before_response();
                 stream.write_all(response.as_bytes()).unwrap();
             }
             requests
@@ -1025,6 +1175,91 @@ mod transport_tests {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+    #[test]
+    fn external_probe_sends_a_single_credential_free_get() {
+        let (client, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 22\r\nSet-Cookie: yudear=unused\r\n\r\nMicrosoft Connect Test",
+        ]);
+        assert_eq!(client.check_external(), ExternalReachability::Reachable);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let (head, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n")
+        );
+        assert!(!head.contains("Cookie:"));
+        assert!(!head.contains("Authorization:"));
+        assert!(!head.contains("X-CSRF-Token:"));
+        assert!(body.is_empty());
+    }
+    #[test]
+    fn external_probe_requires_the_exact_ncsi_status_and_body() {
+        for response in [
+            "HTTP/1.1 201 Created\r\nContent-Length: 22\r\n\r\nMicrosoft Connect Test",
+            "HTTP/1.1 200 OK\r\nContent-Length: 23\r\n\r\nMicrosoft Connect Test\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n16\r\nMicrosoft Connect Test\r\n0\r\n",
+        ] {
+            let (client, server) = serve(vec![response]);
+            assert_eq!(client.check_external(), ExternalReachability::Inconclusive);
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn external_probe_labels_only_the_expected_captive_redirect() {
+        for (response, expected) in [
+            (
+                "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/52?userip=127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+                ExternalReachability::PortalRedirect,
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nLocation: http://172.30.21.100/api/r/52?userip=127.0.0.2\r\nContent-Length: 0\r\n\r\n",
+                ExternalReachability::Inconclusive,
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nLocation: http://elsewhere.example/api/r/52?userip=127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+                ExternalReachability::Inconclusive,
+            ),
+        ] {
+            let (client, server) = serve(vec![response]);
+            assert_eq!(client.check_external(), expected);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn external_probe_discards_a_result_after_the_network_changes() {
+        let current = Arc::new(AtomicBool::new(true));
+        let server_current = Arc::clone(&current);
+        let (mut client, server) = serve_with(
+            vec!["HTTP/1.1 200 OK\r\nContent-Length: 22\r\n\r\nMicrosoft Connect Test"],
+            move || server_current.store(false, Ordering::SeqCst),
+        );
+        client.guard = Box::new(move || current.load(Ordering::SeqCst));
+        assert_eq!(
+            client.check_external(),
+            ExternalReachability::NetworkChanged
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+    #[test]
+    fn external_probe_skips_io_for_an_obsolete_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = PortalClient {
+            local: Ipv4Addr::LOCALHOST,
+            remote: SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port()),
+            interface_index: None,
+            guard: Box::new(|| false),
+            gate: Arc::new(Mutex::new(())),
+        };
+        assert_eq!(
+            client.check_external(),
+            ExternalReachability::NetworkChanged
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
     #[test]
     fn non_portal_sensitive_requests_are_rejected_before_connecting() {

@@ -5,7 +5,8 @@ Build and capture an isolated native UI with fake data, without running the work
 The preview lives off screen and does not receive foreground focus. Validation
 checks may click Save only with deliberately invalid fake fields that return
 before any credential, registry, or controller transaction. It never clicks
-Delete, the portal link, or a network operation. Captures use PrintWindow rather
+Delete or the portal link. Diagnostic buttons use fake data and do not perform
+network operations or write to the clipboard. Captures use PrintWindow rather
 than the desktop so other applications and real account data are excluded.
 The matching preview PID is always closed, including on screenshot failure.
 #>
@@ -31,6 +32,7 @@ param(
     [switch]$VerifyTrayActivation,
     [switch]$VerifyValidation,
     [switch]$VerifyAnalytics,
+    [switch]$VerifyDiagnostics,
     [switch]$LongAdapter,
     [switch]$UnbrokenAdapter,
     [switch]$DiagnoseStatus
@@ -41,7 +43,7 @@ $ErrorActionPreference = 'Stop'
 $workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildDir = Join-Path $workspace 'target\ui-review'
 New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
-$captureDir = Join-Path ([IO.Path]::GetTempPath()) ('campus-guardian-ui-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+$captureDir = Join-Path ([IO.Path]::GetTempPath()) ('campus-guardian-ui-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $PID)
 New-Item -ItemType Directory -Path $captureDir -Force | Out-Null
 
 if (-not $ResourceLibrary) {
@@ -52,8 +54,9 @@ if (-not $ResourceLibrary -or -not (Test-Path -LiteralPath $ResourceLibrary -Pat
     throw 'No compiled guardian.lib found. Build the application once before using this preview.'
 }
 
-$previewSource = Join-Path $buildDir 'preview.rs'
-$previewExe = Join-Path $buildDir ('preview-' + (Get-Date -Format 'yyyyMMddHHmmssfff') + '.exe')
+$previewBase = Join-Path $buildDir ('preview-' + (Get-Date -Format 'yyyyMMddHHmmssfff') + '-' + $PID)
+$previewSource = $previewBase + '.rs'
+$previewExe = $previewBase + '.exe'
 $uiSource = (Join-Path $workspace 'src\windows_ui.rs').Replace('\', '/')
 $previewText = @'
 #![windows_subsystem = "windows"]
@@ -108,6 +111,23 @@ fn main() {
     let info_time = Rc::clone(&requested);
     let analytics_enabled = Rc::new(Cell::new(false));
     let analytics_preference = Rc::clone(&analytics_enabled);
+    let external_requested = Rc::new(Cell::new(None::<Instant>));
+    let external_result = Rc::clone(&external_requested);
+    let dual = selected_status.as_deref() == Ok("dual");
+    let diagnostics_summary = move || {
+        let external = match external_result.get() {
+            None => "未检测",
+            Some(start) if start.elapsed() < Duration::from_millis(350) => "正在检测",
+            Some(_) => "可访问",
+        };
+        let wifi = format!("Wi-Fi：网络接入 已匹配 · 校园网认证 已认证\r\n运营商拨号 无需拨号 · IPv4 外网 {external} · 下次检查 约 45 秒后");
+        if dual {
+            format!("{wifi}\r\n\r\n以太网：网络接入 未连接或不可用 · 校园网认证 待检查\r\n运营商拨号 待确认 · IPv4 外网 未检测")
+        } else {
+            wifi
+        }
+    };
+    let report_summary = diagnostics_summary.clone();
     let result = windows_ui::run(
         windows_ui::Settings {
             adapter_id: "preview-adapter".into(),
@@ -149,6 +169,12 @@ fn main() {
                 analytics_enabled.set(enabled);
                 Ok(())
             }),
+        },
+        windows_ui::UiDiagnostics {
+            summary: Box::new(diagnostics_summary),
+            report: Box::new(move || format!("校园网守护诊断报告\r\n{}\r\n\r\n最近恢复记录\r\n{}",
+                report_summary(), "  刚刚 · Wi-Fi · 校园网认证：已认证（演示）\r\n".repeat(30))),
+            check_external: Box::new(move || external_requested.set(Some(Instant::now()))),
         },
     );
     if let Err(error) = result {
@@ -276,7 +302,7 @@ function Test-PreviewNavigation([IntPtr]$Window) {
         [GuardianPreviewNative]::PostMessage($Window, 0x28, $nav, [IntPtr]1) | Out-Null
         Start-Sleep -Milliseconds 100
         $ids = [Collections.Generic.List[int]]::new()
-        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,305,306,110,201,203) } else { @(301,302,303,304,305,306,101,135,102,103,104,105,106,107,138) }
+        $allowed = if ($navigationPage -eq 'overview') { @(301,302,303,304,305,306,110,201,203,207,142,143) } else { @(301,302,303,304,305,306,101,135,102,103,104,105,106,107,138) }
         for ($tab = 0; $tab -lt 20; $tab++) {
             $focus = [GuardianPreviewNative]::PreviewFocus($Window)
             if ($focus -eq [IntPtr]::Zero) { throw 'Preview does not expose background keyboard focus; no foreground activation was attempted.' }
@@ -840,6 +866,68 @@ function Test-PreviewAnalytics([IntPtr]$Window) {
     'Analytics starts off, can be enabled and disabled independently, and opens from the tray without granting consent.'
 }
 
+function Test-PreviewDiagnostics([IntPtr]$Window) {
+    $overview = [GuardianPreviewNative]::GetDlgItem($Window, 301)
+    [GuardianPreviewNative]::SendMessage($overview, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $summary = Read-PreviewControl $Window 141
+    foreach ($stage in @('网络接入', '校园网认证', '运营商拨号', 'IPv4 外网')) {
+        if (-not $summary.Contains($stage)) { throw "Connection diagnostics do not expose the $stage stage." }
+    }
+    if ($Status -eq 'dual' -and ($summary -notmatch 'Wi-Fi' -or $summary -notmatch '以太网')) {
+        throw 'Connection diagnostics are missing the second network.'
+    }
+    $check = [GuardianPreviewNative]::GetDlgItem($Window, 207)
+    [GuardianPreviewNative]::SendMessage($check, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    while ((Read-PreviewControl $Window 141) -notmatch 'IPv4 外网 可访问' -and $elapsed.ElapsedMilliseconds -lt 3500) {
+        Start-Sleep -Milliseconds 50
+    }
+    if ((Read-PreviewControl $Window 141) -notmatch 'IPv4 外网 可访问') {
+        throw 'The fake external result did not refresh independently of the guardian status.'
+    }
+
+    $toggle = [GuardianPreviewNative]::GetDlgItem($Window, 142)
+    $copy = [GuardianPreviewNative]::GetDlgItem($Window, 143)
+    $report = [GuardianPreviewNative]::GetDlgItem($Window, 144)
+    if ([GuardianPreviewNative]::IsWindowVisible($report)) { throw 'Recovery history should start collapsed.' }
+    [GuardianPreviewNative]::SendMessage($toggle, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $style = [GuardianPreviewNative]::GetWindowStyle($report, -16).ToInt64()
+    if (-not [GuardianPreviewNative]::IsWindowVisible($report) -or ($style -band 0x804) -ne 0x804 -or
+        -not (Read-PreviewControl $Window 144).StartsWith("最近恢复记录`r`n")) {
+        throw 'Recovery history did not expand in a read-only multiline control.'
+    }
+    [GuardianPreviewNative]::SendMessage($report, 0xb6, [IntPtr]::Zero, [IntPtr]12) | Out-Null
+    if ([GuardianPreviewNative]::SendMessage($report, 0xce, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -le 0) {
+        throw 'The bounded recovery history did not scroll.'
+    }
+    [GuardianPreviewNative]::SendMessage($copy, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    if ((Read-PreviewControl $Window 145) -ne '演示诊断已生成。') { throw 'The preview-safe copy action did not acknowledge the report.' }
+
+    if ([GuardianPreviewNative]::PreviewFocus($Window) -ne $copy) { throw 'The copy button did not receive native focus.' }
+    [GuardianPreviewNative]::PostMessage($copy, 0x100, [IntPtr]9, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 100
+    if ([GuardianPreviewNative]::PreviewFocus($Window) -ne $report) { throw 'Tab from Copy did not focus recovery history.' }
+    if ([GuardianPreviewNative]::SendMessage($report, 0xb0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() -ne 0) {
+        throw 'Tab into recovery history selected the report text.'
+    }
+    $bounds = [GuardianPreviewNative+Rect]::new()
+    $client = [GuardianPreviewNative+Rect]::new()
+    [GuardianPreviewNative]::GetWindowRect($report, [ref]$bounds) | Out-Null
+    [GuardianPreviewNative]::GetClientRect($Window, [ref]$client) | Out-Null
+    [GuardianPreviewNative]::MapWindowPoints($Window, [IntPtr]::Zero, [ref]$client, 2) | Out-Null
+    if ($bounds.Top -lt $client.Top -or $bounds.Bottom -gt $client.Bottom) {
+        throw 'Tab focus did not reveal the entire recovery history control.'
+    }
+    [GuardianPreviewNative]::SendMessage($report, 0xb6, [IntPtr]::Zero, [IntPtr](-100)) | Out-Null
+
+    $capture = Join-Path $captureDir ("overview-diagnostics-$Dpi-$Status.png")
+    Save-PreviewWindow $Window $capture
+    Write-Output $capture
+    [GuardianPreviewNative]::SendMessage($toggle, 0xf5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    if ([GuardianPreviewNative]::IsWindowVisible($report)) { throw 'Recovery history did not collapse.' }
+    'Connection diagnostics expose each stage, refresh the fake external result, support keyboard and scroll access to history, and acknowledge preview-safe copying.'
+}
+
 function Save-PreviewWindow([IntPtr]$Window, [string]$Destination) {
     $rect = [GuardianPreviewNative+Rect]::new()
     $gotRect = if ($ClientOnly) { [GuardianPreviewNative]::GetClientRect($Window, [ref]$rect) } else { [GuardianPreviewNative]::GetWindowRect($Window, [ref]$rect) }
@@ -982,6 +1070,9 @@ try {
         $analyticsCapture = Join-Path $captureDir ("settings-analytics-$Dpi.png")
         Save-PreviewWindow $previewWindow $analyticsCapture
         Write-Output $analyticsCapture
+    }
+    if ($VerifyDiagnostics) {
+        Test-PreviewDiagnostics $previewWindow | Write-Output
     }
     if ($DiagnoseStatus) {
         Get-PreviewStatusDiagnostics $previewWindow | Write-Output

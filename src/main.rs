@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod analytics;
+mod connectivity_diagnostics;
+mod diagnostics;
 mod update;
 mod windows_ui;
 mod winhttp;
@@ -12,6 +14,8 @@ use campus_network_guardian::{
     routing::{RoutePreference, RouteTarget},
     wifi_mac,
 };
+use connectivity_diagnostics::ConnectionDiagnostics;
+use diagnostics::{Action as DiagnosticAction, Kind as NetworkKind, Role};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -559,9 +563,12 @@ impl GuardedNetwork {
         applied_generation: u64,
         generation: &Arc<AtomicU64>,
         gate: &Arc<Mutex<()>>,
+        diagnostics: &ConnectionDiagnostics,
+        role: Role,
     ) -> Result<(), CredentialsUnavailable> {
         let state = network::inspect_connection(&self.identity)
             .unwrap_or(network::ConnectionState::Unavailable);
+        diagnostics.observe_link(role, &self.identity, state, applied_generation);
         let connection = state.connection();
         if connection != self.last_connection {
             self.network_changed(Instant::now());
@@ -624,6 +631,7 @@ impl GuardedNetwork {
             Arc::clone(gate),
         );
         let portal_status = portal.status();
+        diagnostics.observe_portal(role, portal_status);
         let action = self.observe_status(Instant::now(), portal_status);
         if action == Action::NetworkChanged {
             self.last_connection = None;
@@ -642,15 +650,42 @@ impl GuardedNetwork {
         let outcome = match action {
             Action::Login => match windows_ui::read_password(username) {
                 Ok(Some(mut password)) if !password.is_empty() => {
+                    diagnostics.record(role, DiagnosticAction::LoginStarted);
                     let result = portal.login(username, &password).map(Some);
                     erase_password(&mut password);
                     result
                 }
                 _ => return Err(CredentialsUnavailable),
             },
-            Action::Redial => portal.redial().map(|()| None),
+            Action::Redial => {
+                diagnostics.record(role, DiagnosticAction::RedialStarted);
+                portal.redial().map(|()| None)
+            }
             _ => unreachable!(),
         };
+        let diagnostic_outcome = match (action, outcome) {
+            (Action::Login, Ok(Some(PortalStatus::Online(_)))) => DiagnosticAction::LoginSucceeded,
+            (
+                Action::Login,
+                Err(PortalError::Network | PortalError::Unexpected | PortalError::NetworkChanged),
+            ) => DiagnosticAction::LoginUnconfirmed,
+            (Action::Login, _) => DiagnosticAction::LoginFailed,
+            (Action::Redial, Ok(_)) => DiagnosticAction::RedialAccepted,
+            (
+                Action::Redial,
+                Err(PortalError::Network | PortalError::Unexpected | PortalError::NetworkChanged),
+            ) => DiagnosticAction::RedialUnconfirmed,
+            (Action::Redial, _) => DiagnosticAction::RedialFailed,
+            _ => unreachable!(),
+        };
+        diagnostics.record(role, diagnostic_outcome);
+        match outcome {
+            Ok(Some(status)) => diagnostics.observe_portal(role, Ok(status)),
+            Err(PortalError::NetworkChanged) => {
+                diagnostics.observe_portal(role, Err(PortalError::NetworkChanged));
+            }
+            _ => {}
+        }
         let now = Instant::now();
         match outcome {
             Err(PortalError::NetworkChanged) => {
@@ -663,6 +698,16 @@ impl GuardedNetwork {
         self.controller.on_action_result(now, action, outcome);
         self.message = self.controller.message();
         Ok(())
+    }
+
+    fn next_diagnostic_check(&self, now: Instant) -> Option<Duration> {
+        (self.last_connection.is_some() && self.controller.configuration_available()).then(|| {
+            self.mac_retry_at
+                .map_or(self.controller.next(), |mac| {
+                    mac.max(self.controller.next())
+                })
+                .saturating_duration_since(now)
+        })
     }
 }
 
@@ -760,8 +805,10 @@ fn worker(
     generation: Arc<AtomicU64>,
     gate: Arc<Mutex<()>>,
     routing: Arc<Mutex<Option<RoutePreference>>>,
+    diagnostics: ConnectionDiagnostics,
 ) {
     let mut networks = startup_networks(Instant::now(), config.as_ref(), windows_ui::read_password);
+    configure_diagnostics(&diagnostics, &networks);
     let can_adjust_routes = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0;
     let mut route_message = None;
     display_networks(&status, &networks, route_message);
@@ -808,6 +855,7 @@ fn worker(
                         .collect();
                     config = Some(candidate);
                     applied_generation = generation.load(Ordering::SeqCst);
+                    configure_diagnostics(&diagnostics, &networks);
                     display_networks(&status, &networks, None);
                     Ok(())
                 });
@@ -833,6 +881,7 @@ fn worker(
             }
             Ok(Event::NetworkChanged(event_generation)) => {
                 applied_generation = event_generation;
+                diagnostics.invalidate();
                 for network in &mut networks {
                     network.network_changed(Instant::now());
                 }
@@ -847,12 +896,19 @@ fn worker(
         }
         if let Some(saved) = config.as_ref() {
             let mut credentials_unavailable = false;
-            for network in &mut networks {
+            for (role, network) in Role::ALL.into_iter().zip(&mut networks) {
                 if generation.load(Ordering::SeqCst) != applied_generation {
                     break;
                 }
                 if network
-                    .check(&saved.username, applied_generation, &generation, &gate)
+                    .check(
+                        &saved.username,
+                        applied_generation,
+                        &generation,
+                        &gate,
+                        &diagnostics,
+                        role,
+                    )
                     .is_err()
                 {
                     credentials_unavailable = true;
@@ -864,6 +920,10 @@ fn worker(
                     network.pause("密码不可用，自动操作已暂停，请打开设置");
                 }
             }
+        }
+        let now = Instant::now();
+        for (role, network) in Role::ALL.into_iter().zip(&networks) {
+            diagnostics.next_check(role, network.next_diagnostic_check(now));
         }
         if let Ok(_lock) = gate.lock() {
             if generation.load(Ordering::SeqCst) == applied_generation {
@@ -883,6 +943,22 @@ fn worker(
     }
 }
 
+fn configure_diagnostics(diagnostics: &ConnectionDiagnostics, networks: &[GuardedNetwork]) {
+    let roles = Role::ALL
+        .into_iter()
+        .zip(networks)
+        .map(|(role, network)| {
+            let kind = if network.identity.ssid.is_some() {
+                NetworkKind::Wifi
+            } else {
+                NetworkKind::Ethernet
+            };
+            (role, kind)
+        })
+        .collect::<Vec<_>>();
+    diagnostics.configure(&roles);
+}
+
 fn main() {
     if !matches!(windows_ui::single_instance(), Ok(true)) {
         if std::env::args().any(|arg| arg == "--show") {
@@ -897,6 +973,7 @@ fn main() {
     initial.autostart = windows_ui::autostart_enabled().unwrap_or(initial.autostart);
     let status = Arc::new(Mutex::new("正在启动".to_string()));
     let generation = Arc::new(AtomicU64::new(0));
+    let diagnostics = ConnectionDiagnostics::new(Arc::clone(&generation));
     let gate = Arc::new(Mutex::new(()));
     let (tx, rx) = mpsc::channel();
     let worker_status = Arc::clone(&status);
@@ -904,6 +981,7 @@ fn main() {
     let worker_gate = Arc::clone(&gate);
     let routing = Arc::new(Mutex::new(Some(RoutePreference::default())));
     let worker_routing = Arc::clone(&routing);
+    let worker_diagnostics = diagnostics.clone();
     thread::spawn(move || {
         worker(
             rx,
@@ -912,6 +990,7 @@ fn main() {
             worker_generation,
             worker_gate,
             worker_routing,
+            worker_diagnostics,
         )
     });
     let adapters = Box::new(|| {
@@ -938,6 +1017,8 @@ fn main() {
     let update_info = updates.clone();
     let analytics = analytics::start();
     let analytics_status = analytics.clone();
+    let diagnostics_summary = diagnostics.clone();
+    let diagnostics_report = diagnostics.clone();
     let _ = windows_ui::run(
         initial,
         adapters,
@@ -969,6 +1050,11 @@ fn main() {
         windows_ui::UiAnalytics {
             enabled: Box::new(move || analytics_status.enabled()),
             set_enabled: Box::new(move |enabled| analytics.set_enabled(enabled)),
+        },
+        windows_ui::UiDiagnostics {
+            summary: Box::new(move || diagnostics_summary.summary()),
+            report: Box::new(move || diagnostics_report.report()),
+            check_external: Box::new(move || diagnostics.check_external()),
         },
     );
     // Restore temporary routing as the UI exits, even when a portal GET is
